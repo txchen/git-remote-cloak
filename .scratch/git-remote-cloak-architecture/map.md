@@ -24,6 +24,7 @@ Produce a decision-ready, evidence-validated architecture and product specificat
 - [Select cryptographic building blocks and Recovery Secret format](issues/03-select-cryptographic-building-blocks.md) — Use a random 256-bit secret, versioned 24-word entropy encoding, domain-separated keys, authenticated chunk encryption, and keyed portable identifiers; whole-repository rollback needs external trusted state.
 - [Choose the Ciphertext Repository representation](issues/04-choose-ciphertext-representation.md) — Publish complete snapshots through one transactional Storage Ref using a public authenticated header, encrypted refs/manifest/indexes, and self-contained native Git packs split into immutable 32 MiB ciphertext-addressed chunks.
 - [Prototype the full Git round trip](issues/05-prototype-git-round-trip.md) — Real Git round trips preserved exact reachable OIDs, logical refs, signatures, shallow semantics, and interruption safety while exposing only the fixed Storage Ref and opaque wrapper objects.
+- [Benchmark storage and transfer overhead](issues/06-benchmark-storage-and-transfer.md) — Self-contained incremental payloads are acceptable for small repositories only with first-class compaction: the live snapshot measured 1.38× ordinary Git, retained Storage History 1.88×, and compacted storage 1.04×.
 
 ## Not yet specified
 
