@@ -27,6 +27,7 @@ Produce a decision-ready, evidence-validated architecture and product specificat
 - [Benchmark storage and transfer overhead](issues/06-benchmark-storage-and-transfer.md) — Self-contained incremental payloads are acceptable for small repositories only with first-class compaction: the live snapshot measured 1.38× ordinary Git, retained Storage History 1.88×, and compacted storage 1.04×.
 - [Define the credential, recovery, and failure contract](issues/07-define-operational-contract.md) — Human setup may prompt while ordinary Git stays unattended; persistent cache and journals support safe retries, CAS protects writers, checkpoints detect known rollback, and explicit Rekey and Compaction rebuild validated snapshots.
 - [Define the repository-format migration contract](issues/09-define-format-migration-contract.md) — Stable bounded version discovery enables fail-closed capability checks; explicit same-secret Migration atomically publishes a validated parentless target-format snapshot without automatic upgrades or downgrade support.
+- [Lock the decision-ready v1 architecture and product spec](issues/08-lock-v1-architecture-spec.md) — The final specification consolidates the single-owner product contract, deep Module boundaries, one-Storage-Ref representation, Tink Go AES-256-GCM-SIV format, operations, capacity expectations, exclusions, and named production verification gates.
 
 ## Not yet specified
 

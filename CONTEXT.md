@@ -115,3 +115,19 @@ _Avoid_: Automatic upgrade, Compaction, Rekey
 **Rollback Checkpoint**:
 Trusted local or external state recording the highest authenticated storage generation observed for a Ciphertext Repository.
 _Avoid_: Backup snapshot, cache
+
+**Repository Engine**:
+The deep Module that coordinates logical Git operations, Ciphertext Snapshot validation and publication, concurrency, recovery, and maintenance behind the command frontends.
+_Avoid_: Remote helper, command-line parser, storage transport
+
+**Format Registry**:
+The Module that selects an exact Ciphertext Repository reader or writer from the authenticated format and required-feature declarations.
+_Avoid_: Generic CBOR parser, automatic migrator
+
+**Storage Transport**:
+The Seam through which Cloak reads, fetches, uploads, and compare-and-swap publishes the Storage Ref using ordinary Git transport.
+_Avoid_: Repository Host API, Recovery Secret transport
+
+**Snapshot Rebuild**:
+The shared internal Repository Engine operation that constructs and validates a complete replacement Ciphertext Snapshot for Compaction, Rekey, or Format Migration under operation-specific identity and publication rules.
+_Avoid_: Compaction, migration, remote reset
