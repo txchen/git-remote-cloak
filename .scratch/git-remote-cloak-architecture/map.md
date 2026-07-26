@@ -26,6 +26,7 @@ Produce a decision-ready, evidence-validated architecture and product specificat
 - [Prototype the full Git round trip](issues/05-prototype-git-round-trip.md) — Real Git round trips preserved exact reachable OIDs, logical refs, signatures, shallow semantics, and interruption safety while exposing only the fixed Storage Ref and opaque wrapper objects.
 - [Benchmark storage and transfer overhead](issues/06-benchmark-storage-and-transfer.md) — Self-contained incremental payloads are acceptable for small repositories only with first-class compaction: the live snapshot measured 1.38× ordinary Git, retained Storage History 1.88×, and compacted storage 1.04×.
 - [Define the credential, recovery, and failure contract](issues/07-define-operational-contract.md) — Human setup may prompt while ordinary Git stays unattended; persistent cache and journals support safe retries, CAS protects writers, checkpoints detect known rollback, and explicit Rekey and Compaction rebuild validated snapshots.
+- [Define the repository-format migration contract](issues/09-define-format-migration-contract.md) — Stable bounded version discovery enables fail-closed capability checks; explicit same-secret Migration atomically publishes a validated parentless target-format snapshot without automatic upgrades or downgrade support.
 
 ## Not yet specified
 

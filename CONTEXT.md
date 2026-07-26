@@ -60,6 +60,10 @@ _Avoid_: Repository history, backup history, original history
 Public authenticated metadata that identifies a Ciphertext Repository and its format without containing Protected Plaintext.
 _Avoid_: Manifest, repository config, plaintext metadata
 
+**Bootstrap Preamble**:
+The bounded public prefix used only to select a Bootstrap Header parser before the header can be authenticated.
+_Avoid_: Bootstrap Header, manifest, trusted metadata
+
 **Repository ID**:
 A random public identifier that distinguishes one Ciphertext Repository and binds its cryptographic context without identifying its plaintext contents.
 _Avoid_: Repository name, Git remote ID, Recovery Secret
@@ -103,6 +107,10 @@ _Avoid_: Password change, envelope rotation
 **Compaction**:
 Replacement of fragmented Pack Payloads with a validated optimized Ciphertext Snapshot while preserving the Recovery Secret and Logical Repository.
 _Avoid_: Rekey, history rewrite
+
+**Format Migration**:
+Replacement of a Ciphertext Repository snapshot with a validated newer-format snapshot while preserving the Recovery Secret, Repository ID, and Logical Repository.
+_Avoid_: Automatic upgrade, Compaction, Rekey
 
 **Rollback Checkpoint**:
 Trusted local or external state recording the highest authenticated storage generation observed for a Ciphertext Repository.
