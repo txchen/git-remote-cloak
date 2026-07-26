@@ -1,7 +1,7 @@
 # Lock the decision-ready v1 architecture and product spec
 
 Type: grilling
-Blocked by: 01, 05, 06, 07
+Blocked by: 01, 05, 06, 07, 09
 
 ## Question
 

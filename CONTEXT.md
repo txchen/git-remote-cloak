@@ -87,3 +87,23 @@ _Avoid_: Bootstrap Header, Git manifest, public index
 **Ciphertext Snapshot**:
 The complete set of Bootstrap Header, encrypted metadata, and immutable ciphertext objects referenced by one published Storage History state.
 _Avoid_: Backup snapshot, plaintext snapshot, storage commit
+
+**Logical Repository**:
+The ordinary plaintext Git refs, reachable objects, and Plaintext Workspace presented to an Authorized Host.
+_Avoid_: Ciphertext Repository, storage repository
+
+**Logical HEAD**:
+The encrypted symbolic ref that selects the default Logical Ref checked out by a clone.
+_Avoid_: Storage Ref, hosted default branch
+
+**Rekey**:
+Replacement of a Ciphertext Repository from a complete local Logical Repository using a new Recovery Secret and Repository ID, without requiring the old Recovery Secret.
+_Avoid_: Password change, envelope rotation
+
+**Compaction**:
+Replacement of fragmented Pack Payloads with a validated optimized Ciphertext Snapshot while preserving the Recovery Secret and Logical Repository.
+_Avoid_: Rekey, history rewrite
+
+**Rollback Checkpoint**:
+Trusted local or external state recording the highest authenticated storage generation observed for a Ciphertext Repository.
+_Avoid_: Backup snapshot, cache

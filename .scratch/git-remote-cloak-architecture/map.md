@@ -25,11 +25,11 @@ Produce a decision-ready, evidence-validated architecture and product specificat
 - [Choose the Ciphertext Repository representation](issues/04-choose-ciphertext-representation.md) — Publish complete snapshots through one transactional Storage Ref using a public authenticated header, encrypted refs/manifest/indexes, and self-contained native Git packs split into immutable 32 MiB ciphertext-addressed chunks.
 - [Prototype the full Git round trip](issues/05-prototype-git-round-trip.md) — Real Git round trips preserved exact reachable OIDs, logical refs, signatures, shallow semantics, and interruption safety while exposing only the fixed Storage Ref and opaque wrapper objects.
 - [Benchmark storage and transfer overhead](issues/06-benchmark-storage-and-transfer.md) — Self-contained incremental payloads are acceptable for small repositories only with first-class compaction: the live snapshot measured 1.38× ordinary Git, retained Storage History 1.88×, and compacted storage 1.04×.
+- [Define the credential, recovery, and failure contract](issues/07-define-operational-contract.md) — Human setup may prompt while ordinary Git stays unattended; persistent cache and journals support safe retries, CAS protects writers, checkpoints detect known rollback, and explicit Rekey and Compaction rebuild validated snapshots.
 
 ## Not yet specified
 
-- The repository-format migration strategy cannot be made precise until the storage benchmark and operational failure contract are settled.
-- Efficient partial-clone behavior may become a separate decision if the remote-helper protocol and chosen representation expose a useful object-level frontier.
+- None.
 
 ## Out of scope
 
@@ -37,6 +37,7 @@ Produce a decision-ready, evidence-validated architecture and product specificat
 - Multi-owner sharing, member invitation, and per-member revocation.
 - Native Windows binaries; Windows use is through WSL.
 - Git LFS. Cloak must detect and reject LFS-backed content rather than silently bypass protection.
-- Guaranteeing erasure of old ciphertext retained by a Repository Host after Recovery Secret rotation.
+- Partial clone filters and promisor-object behavior; shallow clone remains supported.
+- Guaranteeing erasure of old ciphertext retained by a Repository Host after Rekey.
 - Recovering uncommitted worktree changes, stash, reflog, hooks, local Git configuration, or other non-pushed local state.
 - Recursive shared-secret orchestration for submodules; each private submodule is an independently cloaked repository.
