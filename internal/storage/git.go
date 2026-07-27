@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -49,18 +50,55 @@ func (transport *Git) Close() error {
 
 // PublishSnapshot uploads immutable ciphertext and compare-and-swap publishes through ordinary Git push.
 func (transport *Git) PublishSnapshot(expectedStorageCommitID string, bootstrap []byte, ciphertextObjects map[string][]byte) (string, error) {
-	commitID, err := transport.LocalBare.PublishSnapshot(expectedStorageCommitID, bootstrap, ciphertextObjects)
+	commitID, err := transport.PrepareSnapshot(expectedStorageCommitID, bootstrap, ciphertextObjects)
 	if err != nil {
 		return "", err
+	}
+	if err := transport.PublishPrepared(expectedStorageCommitID, commitID); err != nil {
+		return "", err
+	}
+	return commitID, nil
+}
+
+// PublishPrepared uploads a prepared immutable Storage commit and updates the
+// Storage Ref. Transient transport failures receive at most three attempts.
+func (transport *Git) PublishPrepared(expectedStorageCommitID, commitID string) error {
+	if os.Getenv("CLOAK_TEST_FAULT") == "before-storage-ref" {
+		return errors.New("injected interruption before Storage Ref publication")
+	}
+	if os.Getenv("CLOAK_TEST_FAULT") == "lost-process-before-storage-ref" {
+		os.Exit(86)
 	}
 	lease := "--force-with-lease=" + StorageRef + ":" + expectedStorageCommitID
 	if expectedStorageCommitID == transport.zeroObject {
 		lease = "--force-with-lease=" + StorageRef + ":"
 	}
-	if _, err := runGit(transport.path, nil, "push", lease, "origin", commitID+":"+StorageRef); err != nil {
-		return "", fmt.Errorf("compare-and-swap publish Storage Ref through ordinary Git transport: %w", err)
+	var lastError error
+	for attempt := 0; attempt < 3; attempt++ {
+		if os.Getenv("CLOAK_TEST_FAULT") == "immutable-upload-failure" {
+			lastError = errors.New("injected immutable-object upload failure")
+			continue
+		}
+		if _, err := runGit(transport.path, nil, "push", lease, "origin", commitID+":"+StorageRef); err == nil {
+			if os.Getenv("CLOAK_TEST_FAULT") == "after-storage-ref" {
+				return errors.New("injected lost response after Storage Ref publication")
+			}
+			return nil
+		} else {
+			lastError = err
+			if nonRetryablePushError(err.Error()) {
+				break
+			}
+		}
 	}
-	return commitID, nil
+	return fmt.Errorf("compare-and-swap publish Storage Ref through ordinary Git transport failed after at most 3 attempts: %w", lastError)
+}
+
+// ContainsStorageCommit reports whether a commit is retained in the fetched
+// Storage History.
+func (transport *Git) ContainsStorageCommit(storageCommitID string) bool {
+	_, err := runGit(transport.path, nil, "cat-file", "-e", storageCommitID+"^{commit}")
+	return err == nil
 }
 
 // PublishEmpty creates the initial Ciphertext Snapshot through ordinary Git transport.
@@ -78,4 +116,17 @@ func cleanStorageEnvironment(environment []string) []string {
 		}
 	}
 	return clean
+}
+
+func nonRetryablePushError(message string) bool {
+	lower := strings.ToLower(message)
+	for _, fragment := range []string{
+		"authentication failed", "permission denied", "access denied", "could not read username",
+		"rejected", "stale info", "non-fast-forward", "cannot lock ref", "fetch first",
+	} {
+		if strings.Contains(lower, fragment) {
+			return true
+		}
+	}
+	return false
 }

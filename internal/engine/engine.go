@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/txchen/git-remote-cloak/internal/domain"
@@ -21,11 +22,18 @@ import (
 
 // Engine is the repository-level interface shared by human and Git adapters.
 type Engine struct {
-	formats *cloakformat.Registry
+	formats           *cloakformat.Registry
+	localGitDirectory string
 }
 
 // New returns a production Repository Engine.
 func New() *Engine { return &Engine{formats: cloakformat.NewRegistry()} }
+
+// NewWithLocalState returns an Engine that may reuse Secret-free persistent
+// state owned by gitDirectory.
+func NewWithLocalState(gitDirectory string) *Engine {
+	return &Engine{formats: cloakformat.NewRegistry(), localGitDirectory: gitDirectory}
+}
 
 // Initialize publishes or verifies an empty Ciphertext Repository and configures a remote.
 func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBranch string, secret domain.RecoverySecret) error {
@@ -338,8 +346,29 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 	if strings.Join(candidateObjectIDs, "\n") != strings.Join(reachableObjectIDs, "\n") {
 		return errors.New("candidate Ciphertext Snapshot does not preserve the intended reachable Git objects")
 	}
-	_, err = transport.PublishSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
-	return err
+	preparedStorageCommit, err := transport.PrepareSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
+	if err != nil {
+		return err
+	}
+	intentID, err := localstate.TransactionIntentID(secret, current.Repository.RepositoryID, canonicalTransactionIntent(state))
+	if err != nil {
+		return err
+	}
+	journal := localstate.Transaction{
+		IntentID:                intentID,
+		StartingStorageCommitID: storageCommitID,
+		PreparedStorageCommitID: preparedStorageCommit,
+	}
+	if err := localstate.StoreTransaction(engine.localGitDirectory, journal, secret, current.Repository.RepositoryID); err != nil {
+		return fmt.Errorf("persist crash journal before publication: %w", err)
+	}
+	if err := transport.PublishPrepared(storageCommitID, preparedStorageCommit); err != nil {
+		return err
+	}
+	if err := localstate.RemoveTransaction(engine.localGitDirectory, intentID); err != nil {
+		return fmt.Errorf("remove completed crash journal: %w", err)
+	}
+	return nil
 }
 
 // FetchInto imports authenticated native packs into an existing Git object database.
@@ -459,13 +488,45 @@ func (engine *Engine) decodeTransportSnapshot(secret domain.RecoverySecret, tran
 	if err != nil {
 		return cloakformat.DecodedSnapshot{}, "", err
 	}
+	cache := localstate.NewCache(engine.localGitDirectory)
+	downloaded := make(map[string][]byte)
 	decoded, err := engine.formats.DecodeSnapshotFrom(secret, bootstrap, func(locator string) ([]byte, error) {
-		return transport.ReadObject(storageCommitID, locator)
+		if cached, found := cache.ReadObject(locator); found {
+			return cached, nil
+		}
+		contents, err := transport.ReadObject(storageCommitID, locator)
+		if err == nil {
+			downloaded[locator] = contents
+		}
+		return contents, err
 	})
 	if err != nil {
 		return cloakformat.DecodedSnapshot{}, "", err
 	}
+	// Cache failure can reduce performance but cannot change recoverability.
+	_ = cache.StoreSnapshot(storageCommitID, bootstrap, downloaded)
+	localstate.ReconcileTransactions(engine.localGitDirectory, secret, decoded.Repository.RepositoryID, storageCommitID, transport.ContainsStorageCommit)
 	return decoded, storageCommitID, nil
+}
+
+func canonicalTransactionIntent(state gitdb.State) []byte {
+	refNames := make([]string, 0, len(state.LogicalRefs))
+	for name := range state.LogicalRefs {
+		refNames = append(refNames, name)
+	}
+	sort.Strings(refNames)
+	var canonical strings.Builder
+	canonical.WriteString("logical-head\x00")
+	canonical.WriteString(string(state.LogicalHEAD))
+	canonical.WriteString("\x00object-format\x00")
+	canonical.WriteString(state.ObjectFormat)
+	for _, name := range refNames {
+		canonical.WriteString("\x00ref\x00")
+		canonical.WriteString(name)
+		canonical.WriteByte(0)
+		canonical.WriteString(state.LogicalRefs[name])
+	}
+	return []byte(canonical.String())
 }
 
 func (engine *Engine) recoverDecoded(repositoryURL, destination string, decoded cloakformat.DecodedSnapshot) error {

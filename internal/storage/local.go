@@ -175,6 +175,19 @@ func (transport *LocalBare) PublishEmpty(bootstrap, manifest []byte, locator str
 
 // PublishSnapshot uploads immutable ciphertext before compare-and-swap publishing one Storage History commit.
 func (transport *LocalBare) PublishSnapshot(expectedStorageCommitID string, bootstrap []byte, ciphertextObjects map[string][]byte) (string, error) {
+	commitID, err := transport.PrepareSnapshot(expectedStorageCommitID, bootstrap, ciphertextObjects)
+	if err != nil {
+		return "", err
+	}
+	if err := transport.PublishPrepared(expectedStorageCommitID, commitID); err != nil {
+		return "", err
+	}
+	return commitID, nil
+}
+
+// PrepareSnapshot uploads immutable ciphertext and builds a Storage commit
+// without changing the authoritative Storage Ref.
+func (transport *LocalBare) PrepareSnapshot(expectedStorageCommitID string, bootstrap []byte, ciphertextObjects map[string][]byte) (string, error) {
 	if len(ciphertextObjects) == 0 {
 		return "", errors.New("Ciphertext Snapshot contains no encrypted objects")
 	}
@@ -216,10 +229,15 @@ func (transport *LocalBare) PublishSnapshot(expectedStorageCommitID string, boot
 		return "", fmt.Errorf("build Storage History commit: %w", err)
 	}
 	commitID := strings.TrimSpace(string(commit))
-	if _, err := runGit(transport.path, nil, "update-ref", StorageRef, commitID, expectedStorageCommitID); err != nil {
-		return "", fmt.Errorf("compare-and-swap publish Storage Ref: %w", err)
-	}
 	return commitID, nil
+}
+
+// PublishPrepared atomically changes the Storage Ref to a prepared commit.
+func (transport *LocalBare) PublishPrepared(expectedStorageCommitID, commitID string) error {
+	if _, err := runGit(transport.path, nil, "update-ref", StorageRef, commitID, expectedStorageCommitID); err != nil {
+		return fmt.Errorf("compare-and-swap publish Storage Ref: %w", err)
+	}
+	return nil
 }
 
 func (transport *LocalBare) writeBlob(contents []byte) (string, error) {

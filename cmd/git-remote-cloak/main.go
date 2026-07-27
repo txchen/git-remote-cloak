@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/txchen/git-remote-cloak/internal/domain"
 	"github.com/txchen/git-remote-cloak/internal/engine"
 	cloakformat "github.com/txchen/git-remote-cloak/internal/format"
+	"github.com/txchen/git-remote-cloak/internal/localstate"
 	"github.com/txchen/git-remote-cloak/internal/remotehelper"
 	"github.com/txchen/git-remote-cloak/internal/secret"
 	"golang.org/x/term"
@@ -33,6 +35,8 @@ func run(arguments []string) error {
 		return runInit(arguments[1:])
 	case "clone":
 		return runClone(arguments[1:])
+	case "cache":
+		return runCache(arguments[1:])
 	case "set-head":
 		return runSetHead(arguments[1:])
 	default:
@@ -45,6 +49,22 @@ func run(arguments []string) error {
 		}
 		return usageError()
 	}
+}
+
+func runCache(arguments []string) error {
+	if len(arguments) != 1 || arguments[0] != "clear" {
+		return fmt.Errorf("usage: git-remote-cloak cache clear")
+	}
+	command := exec.Command("git", "rev-parse", "--absolute-git-dir")
+	output, err := command.Output()
+	if err != nil {
+		return fmt.Errorf("cache clear must run inside a Git repository")
+	}
+	if err := localstate.ClearCache(strings.TrimSpace(string(output))); err != nil {
+		return fmt.Errorf("clear reconstructable cache: %w", err)
+	}
+	fmt.Println("Cleared reconstructable Cloak cache.")
+	return nil
 }
 
 func runSetHead(arguments []string) error {
@@ -194,5 +214,5 @@ func acquireSecret(explicitFile string, allowGeneration bool) (domain.RecoverySe
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: git-remote-cloak <init|clone|set-head|version>")
+	return fmt.Errorf("usage: git-remote-cloak <init|clone|cache|set-head|version>")
 }

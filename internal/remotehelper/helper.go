@@ -26,24 +26,18 @@ type shallowFetchRequest struct {
 
 // Run serves one non-interactive Git remote-helper session.
 func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Reader, output io.Writer) error {
+	repositoryEngine := engine.New()
 	if gitDirectory, err := currentGitDirectory(); err == nil {
 		if err := gitdb.RejectPromisorState(gitDirectory); err != nil {
 			return err
 		}
+		if !isGitCloneScaffold(gitDirectory) {
+			repositoryEngine = engine.NewWithLocalState(gitDirectory)
+		}
 	}
-	repositoryEngine := engine.New()
 	repository, err := repositoryEngine.Inspect(repositoryURL, recoverySecret)
 	if err != nil {
 		return err
-	}
-	if len(repository.LogicalRefs) == 0 {
-		if err := secureEmptyGitCloneScaffold(); err != nil {
-			return err
-		}
-	} else {
-		if err := atomicallyRecoverGitClone(repositoryEngine, repositoryURL, recoverySecret); err != nil {
-			return err
-		}
 	}
 	if err := restoreMissingLogicalHEAD(repository.LogicalHEAD); err != nil {
 		return err
@@ -51,6 +45,9 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 	reader := bufio.NewScanner(input)
 	writer := bufio.NewWriter(output)
 	inFetchBatch := false
+	cloning := false
+	cloneRecovered := false
+	partialCloneRejected := false
 	shallowFetch := shallowFetchRequest{objectIDs: make([]string, 0, 1)}
 	pushes := make([]engine.RefUpdate, 0, 1)
 	for reader.Scan() {
@@ -79,6 +76,7 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 			}
 		case strings.HasPrefix(command, "option filter ") ||
 			command == "option from-promisor true" || command == "option no-dependents true":
+			partialCloneRejected = true
 			if _, err := fmt.Fprint(writer, "error partial clone filters and promisor objects are unsupported\n"); err != nil {
 				return err
 			}
@@ -101,6 +99,21 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 			}
 		case command == "option deepen-relative false":
 			shallowFetch.relative = false
+			if _, err := fmt.Fprint(writer, "ok\n"); err != nil {
+				return err
+			}
+		case command == "option cloning true":
+			cloning = true
+			if len(repository.LogicalRefs) == 0 {
+				if err := secureEmptyGitCloneScaffold(); err != nil {
+					return err
+				}
+			}
+			if _, err := fmt.Fprint(writer, "ok\n"); err != nil {
+				return err
+			}
+		case command == "option cloning false":
+			cloning = false
 			if _, err := fmt.Fprint(writer, "ok\n"); err != nil {
 				return err
 			}
@@ -150,13 +163,22 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 			_, _ = fmt.Fprint(writer, "\n")
 			return writer.Flush()
 		case command == "":
-			if len(repository.LogicalRefs) == 0 {
+			if cloning && len(repository.LogicalRefs) == 0 {
 				if err := atomicallyRecoverGitClone(repositoryEngine, repositoryURL, recoverySecret); err != nil {
 					return err
 				}
 			}
 			return nil
 		case strings.HasPrefix(command, "fetch "):
+			if partialCloneRejected {
+				return errors.New("partial clone filters and promisor objects are unsupported")
+			}
+			if cloning && !cloneRecovered && len(repository.LogicalRefs) != 0 {
+				if err := atomicallyRecoverGitClone(repositoryEngine, repositoryURL, recoverySecret); err != nil {
+					return err
+				}
+				cloneRecovered = true
+			}
 			inFetchBatch = true
 			fields := strings.Fields(command)
 			if len(fields) < 2 {
@@ -176,7 +198,21 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 			return err
 		}
 	}
-	return reader.Err()
+	if err := reader.Err(); err != nil {
+		return err
+	}
+	if cloning && len(repository.LogicalRefs) == 0 {
+		return atomicallyRecoverGitClone(repositoryEngine, repositoryURL, recoverySecret)
+	}
+	return nil
+}
+
+func isGitCloneScaffold(gitDirectory string) bool {
+	if filepath.Base(gitDirectory) != ".git" {
+		return false
+	}
+	entries, err := os.ReadDir(filepath.Dir(gitDirectory))
+	return err == nil && len(entries) == 1 && entries[0].Name() == ".git" && entries[0].IsDir()
 }
 
 func secureEmptyGitCloneScaffold() error {
