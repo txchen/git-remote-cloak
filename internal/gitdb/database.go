@@ -14,7 +14,7 @@ import (
 	cloakformat "github.com/txchen/git-remote-cloak/internal/format"
 )
 
-// State is the public Git state authenticated by an Encrypted Manifest.
+// State is the Logical Repository state authenticated by an Encrypted Manifest.
 type State struct {
 	LogicalHEAD  domain.LogicalHEAD
 	ObjectFormat string

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,10 +57,11 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 	}
 	configuredRepositoryID, repositoryIDErr := git(workspace, nil, "config", "--get", "remote."+remoteName+".cloakRepositoryID")
 	hasConfiguredRepositoryID := repositoryIDErr == nil
-	transport, err := storage.OpenLocalBare(repositoryURL)
+	transport, err := storage.OpenGit(repositoryURL)
 	if err != nil {
 		return err
 	}
+	defer transport.Close()
 	refs, err := transport.Refs()
 	if err != nil {
 		return err
@@ -90,11 +92,7 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 			return err
 		}
 	case len(refs) == 1 && refs[0] == storage.StorageRef:
-		snapshot, err := transport.Read()
-		if err != nil {
-			return err
-		}
-		decoded, err := engine.decodeSnapshot(secret, snapshot)
+		decoded, _, err := engine.decodeTransportSnapshot(secret, transport)
 		if err != nil {
 			return errors.New("existing Ciphertext Repository has another Cloak identity")
 		}
@@ -122,8 +120,8 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 	return nil
 }
 
-// RecoverEmpty atomically creates an ordinary empty Recovered Repository.
-func (engine *Engine) RecoverEmpty(repositoryURL, destination string, secret domain.RecoverySecret) error {
+// Recover atomically creates and validates a complete Recovered Repository.
+func (engine *Engine) Recover(repositoryURL, destination string, secret domain.RecoverySecret) error {
 	decoded, err := engine.readSnapshot(repositoryURL, secret)
 	if err != nil {
 		return err
@@ -149,9 +147,9 @@ func (engine *Engine) RecoverEmpty(repositoryURL, destination string, secret dom
 	})
 }
 
-// Recover atomically creates and validates a complete Recovered Repository.
-func (engine *Engine) Recover(repositoryURL, destination string, secret domain.RecoverySecret) error {
-	return engine.RecoverEmpty(repositoryURL, destination, secret)
+// RecoverEmpty preserves the ticket #10 empty-repository interface.
+func (engine *Engine) RecoverEmpty(repositoryURL, destination string, secret domain.RecoverySecret) error {
+	return engine.Recover(repositoryURL, destination, secret)
 }
 
 // RecoverForGitClone atomically prepares refs and objects while leaving worktree checkout to Git.
@@ -196,15 +194,12 @@ func (engine *Engine) RecoverBare(repositoryURL, destination string, secret doma
 
 // Publish reads one protected branch from a bare Logical Repository and atomically publishes it.
 func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret domain.RecoverySecret) error {
-	transport, err := storage.OpenLocalBare(repositoryURL)
+	transport, err := storage.OpenGit(repositoryURL)
 	if err != nil {
 		return err
 	}
-	snapshot, err := transport.Read()
-	if err != nil {
-		return err
-	}
-	current, err := engine.decodeSnapshot(secret, snapshot)
+	defer transport.Close()
+	current, storageCommitID, err := engine.decodeTransportSnapshot(secret, transport)
 	if err != nil {
 		return err
 	}
@@ -222,10 +217,10 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 	if err != nil {
 		return err
 	}
-	repository := cloakformat.Repository{
+	repository := cloakformat.SnapshotState{
 		RepositoryID: current.Repository.RepositoryID, Generation: current.Repository.Generation + 1,
 		LogicalHEAD: state.LogicalHEAD, ObjectFormat: state.ObjectFormat, LogicalRefs: state.LogicalRefs,
-		PreviousStorageRef: snapshot.StorageID,
+		PreviousStorageRef: storageCommitID,
 	}
 	encoded, err := engine.formats.EncodeSnapshot(secret, cloakformat.SnapshotInput{
 		Repository: repository, Packs: []cloakformat.PackPayload{payload},
@@ -234,7 +229,7 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 		return err
 	}
 	// Validate the exact candidate logical state before uploading any ciphertext.
-	candidate, err := engine.formats.DecodeSnapshot(secret, encoded.Bootstrap, encoded.Objects)
+	candidate, err := engine.formats.DecodeSnapshot(secret, encoded.Bootstrap, encoded.CiphertextObjects)
 	if err != nil {
 		return fmt.Errorf("validate candidate Ciphertext Snapshot: %w", err)
 	}
@@ -244,10 +239,17 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 	}
 	defer os.RemoveAll(temporaryRoot)
 	temporary := filepath.Join(temporaryRoot, "repository.git")
-	if err := gitdb.Restore(temporary, true, state, candidate.Packs); err != nil {
+	candidateState := gitdb.State{
+		LogicalHEAD: candidate.Repository.LogicalHEAD, ObjectFormat: candidate.Repository.ObjectFormat,
+		LogicalRefs: candidate.Repository.LogicalRefs,
+	}
+	if err := gitdb.Restore(temporary, true, candidateState, candidate.Packs); err != nil {
 		return fmt.Errorf("validate candidate Logical Repository: %w", err)
 	}
-	_, err = transport.PublishSnapshot(snapshot.StorageID, encoded.Bootstrap, encoded.Objects)
+	if candidateState.LogicalHEAD != state.LogicalHEAD || candidateState.ObjectFormat != state.ObjectFormat || !maps.Equal(candidateState.LogicalRefs, state.LogicalRefs) {
+		return errors.New("candidate Ciphertext Snapshot does not preserve the intended Logical Repository state")
+	}
+	_, err = transport.PublishSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
 	return err
 }
 
@@ -288,28 +290,31 @@ func (engine *Engine) PublishRef(repositoryURL, sourceGitDirectory, sourceRef, d
 
 // InspectEmpty authenticates and returns the logical state for a remote-helper adapter.
 func (engine *Engine) InspectEmpty(repositoryURL string, secret domain.RecoverySecret) (cloakformat.EmptyRepository, error) {
-	transport, err := storage.OpenLocalBare(repositoryURL)
+	decoded, err := engine.readSnapshot(repositoryURL, secret)
 	if err != nil {
 		return cloakformat.EmptyRepository{}, err
 	}
-	snapshot, err := transport.Read()
-	if err != nil {
-		return cloakformat.EmptyRepository{}, err
+	if len(decoded.Repository.LogicalRefs) != 0 {
+		return cloakformat.EmptyRepository{}, errors.New("Ciphertext Snapshot is not empty")
 	}
-	return engine.formats.DecodeEmpty(secret, snapshot.Bootstrap, snapshot.Manifest)
+	return cloakformat.EmptyRepository{
+		RepositoryID: decoded.Repository.RepositoryID, LogicalHEAD: decoded.Repository.LogicalHEAD,
+		ObjectFormat: decoded.Repository.ObjectFormat,
+	}, nil
 }
 
 // Inspect authenticates and returns the current logical state.
-func (engine *Engine) Inspect(repositoryURL string, secret domain.RecoverySecret) (cloakformat.Repository, error) {
+func (engine *Engine) Inspect(repositoryURL string, secret domain.RecoverySecret) (cloakformat.SnapshotState, error) {
 	decoded, err := engine.readSnapshot(repositoryURL, secret)
 	return decoded.Repository, err
 }
 
 func (engine *Engine) readSnapshot(repositoryURL string, secret domain.RecoverySecret) (cloakformat.DecodedSnapshot, error) {
-	transport, err := storage.OpenLocalBare(repositoryURL)
+	transport, err := storage.OpenGit(repositoryURL)
 	if err != nil {
 		return cloakformat.DecodedSnapshot{}, err
 	}
+	defer transport.Close()
 	refs, err := transport.Refs()
 	if err != nil {
 		return cloakformat.DecodedSnapshot{}, err
@@ -317,24 +322,22 @@ func (engine *Engine) readSnapshot(repositoryURL string, secret domain.RecoveryS
 	if len(refs) != 1 || refs[0] != storage.StorageRef {
 		return cloakformat.DecodedSnapshot{}, errors.New("Repository Host does not expose exactly one Storage Ref")
 	}
-	snapshot, err := transport.Read()
-	if err != nil {
-		return cloakformat.DecodedSnapshot{}, err
-	}
-	return engine.decodeSnapshot(secret, snapshot)
+	decoded, _, err := engine.decodeTransportSnapshot(secret, transport)
+	return decoded, err
 }
 
-func (engine *Engine) decodeSnapshot(secret domain.RecoverySecret, snapshot storage.Snapshot) (cloakformat.DecodedSnapshot, error) {
-	if snapshot.Manifest != nil {
-		empty, err := engine.formats.DecodeEmpty(secret, snapshot.Bootstrap, snapshot.Manifest)
-		if err == nil {
-			return cloakformat.DecodedSnapshot{Repository: cloakformat.Repository{
-				RepositoryID: empty.RepositoryID, Generation: 1, LogicalHEAD: empty.LogicalHEAD,
-				ObjectFormat: empty.ObjectFormat, LogicalRefs: map[string]string{},
-			}}, nil
-		}
+func (engine *Engine) decodeTransportSnapshot(secret domain.RecoverySecret, transport *storage.Git) (cloakformat.DecodedSnapshot, string, error) {
+	bootstrap, storageCommitID, err := transport.ReadBootstrap()
+	if err != nil {
+		return cloakformat.DecodedSnapshot{}, "", err
 	}
-	return engine.formats.DecodeSnapshot(secret, snapshot.Bootstrap, snapshot.Objects)
+	decoded, err := engine.formats.DecodeSnapshotFrom(secret, bootstrap, func(locator string) ([]byte, error) {
+		return transport.ReadObject(storageCommitID, locator)
+	})
+	if err != nil {
+		return cloakformat.DecodedSnapshot{}, "", err
+	}
+	return decoded, storageCommitID, nil
 }
 
 func (engine *Engine) recoverDecoded(repositoryURL, destination string, decoded cloakformat.DecodedSnapshot) error {
@@ -353,7 +356,7 @@ func (engine *Engine) recoverDecoded(repositoryURL, destination string, decoded 
 	})
 }
 
-func makeEmptyBare(destination string, repository cloakformat.Repository) (string, error) {
+func makeEmptyBare(destination string, repository cloakformat.SnapshotState) (string, error) {
 	branch := strings.TrimPrefix(string(repository.LogicalHEAD), "refs/heads/")
 	command := exec.Command("git", "init", "--bare", "--object-format="+repository.ObjectFormat, "-b", branch, destination)
 	if output, err := command.CombinedOutput(); err != nil {

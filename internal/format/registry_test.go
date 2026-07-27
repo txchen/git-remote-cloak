@@ -48,7 +48,7 @@ func TestV1EmptySnapshotRoundTripsThroughRegistry(t *testing.T) {
 func TestV1PackPayloadRoundTripsWithOpaqueAuthenticatedRecords(t *testing.T) {
 	registry := cloakformat.NewRegistry()
 	input := cloakformat.SnapshotInput{
-		Repository: cloakformat.Repository{
+		Repository: cloakformat.SnapshotState{
 			RepositoryID: testRepositoryID, Generation: 2, LogicalHEAD: "refs/heads/main",
 			ObjectFormat: "sha1", PreviousStorageRef: strings.Repeat("a", 40),
 			LogicalRefs: map[string]string{"refs/heads/main": strings.Repeat("1", 40)},
@@ -62,15 +62,15 @@ func TestV1PackPayloadRoundTripsWithOpaqueAuthenticatedRecords(t *testing.T) {
 		t.Fatalf("encode snapshot: %v", err)
 	}
 	identifier := regexp.MustCompile(`^[a-z2-7]{52}$`)
-	if len(encoded.Objects) != 3 {
-		t.Fatalf("encrypted object count = %d, want manifest, index, and chunk", len(encoded.Objects))
+	if len(encoded.CiphertextObjects) != 3 {
+		t.Fatalf("encrypted object count = %d, want manifest, index, and chunk", len(encoded.CiphertextObjects))
 	}
-	for locator := range encoded.Objects {
+	for locator := range encoded.CiphertextObjects {
 		if !identifier.MatchString(locator) {
 			t.Fatalf("opaque identifier %q is not lowercase unpadded SHA-256 Base32", locator)
 		}
 	}
-	decoded, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, encoded.Objects)
+	decoded, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, encoded.CiphertextObjects)
 	if err != nil {
 		t.Fatalf("decode snapshot: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestV1PackPayloadRoundTripsWithOpaqueAuthenticatedRecords(t *testing.T) {
 func TestV1SnapshotRejectsMissingCorruptedAndSubstitutedEncryptedObjects(t *testing.T) {
 	registry := cloakformat.NewRegistry()
 	input := cloakformat.SnapshotInput{
-		Repository: cloakformat.Repository{
+		Repository: cloakformat.SnapshotState{
 			RepositoryID: testRepositoryID, Generation: 2, LogicalHEAD: "refs/heads/main",
 			ObjectFormat: "sha1", PreviousStorageRef: strings.Repeat("a", 40),
 			LogicalRefs: map[string]string{"refs/heads/main": strings.Repeat("1", 40)},
@@ -96,27 +96,50 @@ func TestV1SnapshotRejectsMissingCorruptedAndSubstitutedEncryptedObjects(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	locators := make([]string, 0, len(encoded.Objects))
-	for locator := range encoded.Objects {
+	locators := make([]string, 0, len(encoded.CiphertextObjects))
+	for locator := range encoded.CiphertextObjects {
 		locators = append(locators, locator)
 	}
 
-	missing := cloneObjects(encoded.Objects)
+	missing := cloneObjects(encoded.CiphertextObjects)
 	delete(missing, locators[0])
 	if _, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, missing); err == nil {
 		t.Fatal("snapshot with missing encrypted object decoded successfully")
 	}
 
-	corrupted := cloneObjects(encoded.Objects)
+	corrupted := cloneObjects(encoded.CiphertextObjects)
 	corrupted[locators[0]][len(corrupted[locators[0]])-1] ^= 1
 	if _, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, corrupted); err == nil {
 		t.Fatal("snapshot with corrupted encrypted object decoded successfully")
 	}
 
-	substituted := cloneObjects(encoded.Objects)
-	substituted[locators[0]] = bytes.Clone(encoded.Objects[locators[1]])
+	substituted := cloneObjects(encoded.CiphertextObjects)
+	substituted[locators[0]] = bytes.Clone(encoded.CiphertextObjects[locators[1]])
 	if _, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, substituted); err == nil {
 		t.Fatal("snapshot with substituted encrypted object decoded successfully")
+	}
+}
+
+func TestV1AuthenticatesBootstrapBeforeResolvingCiphertextObjects(t *testing.T) {
+	registry := cloakformat.NewRegistry()
+	encoded, err := registry.EncodeEmpty(testSecret, cloakformat.EmptyRepository{
+		RepositoryID: testRepositoryID, LogicalHEAD: "refs/heads/main", ObjectFormat: "sha1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap := bytes.Clone(encoded.Bootstrap)
+	bootstrap[len(bootstrap)-1] ^= 1
+	resolveCalls := 0
+	_, err = registry.DecodeSnapshotFrom(testSecret, bootstrap, func(string) ([]byte, error) {
+		resolveCalls++
+		return encoded.Manifest, nil
+	})
+	if err == nil {
+		t.Fatal("snapshot with unauthenticated Bootstrap Header decoded successfully")
+	}
+	if resolveCalls != 0 {
+		t.Fatalf("resolved %d ciphertext objects before authenticating Bootstrap Header", resolveCalls)
 	}
 }
 
@@ -124,7 +147,7 @@ func TestV1PackPayloadSplitsAtFixedMaximumPlaintextChunkSize(t *testing.T) {
 	registry := cloakformat.NewRegistry()
 	pack := bytes.Repeat([]byte{0xa5}, cloakformat.DefaultChunkSize+1)
 	encoded, err := registry.EncodeSnapshot(testSecret, cloakformat.SnapshotInput{
-		Repository: cloakformat.Repository{
+		Repository: cloakformat.SnapshotState{
 			RepositoryID: testRepositoryID, Generation: 2, LogicalHEAD: "refs/heads/main",
 			ObjectFormat: "sha1", PreviousStorageRef: strings.Repeat("a", 40),
 			LogicalRefs: map[string]string{"refs/heads/main": strings.Repeat("1", 40)},
@@ -134,10 +157,10 @@ func TestV1PackPayloadSplitsAtFixedMaximumPlaintextChunkSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(encoded.Objects) != 4 {
-		t.Fatalf("encrypted object count = %d, want manifest, index, and two chunks", len(encoded.Objects))
+	if len(encoded.CiphertextObjects) != 4 {
+		t.Fatalf("encrypted object count = %d, want manifest, index, and two chunks", len(encoded.CiphertextObjects))
 	}
-	decoded, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, encoded.Objects)
+	decoded, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, encoded.CiphertextObjects)
 	if err != nil {
 		t.Fatal(err)
 	}

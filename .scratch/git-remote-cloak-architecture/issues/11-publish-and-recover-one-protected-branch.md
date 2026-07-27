@@ -8,7 +8,7 @@
 
 - [x] The remote-helper `list`, `fetch`, and `push` paths support an ordinary first push of one branch and an ordinary fresh clone without an auxiliary binary or provider API.
 - [x] A push creates a self-contained native Git Pack Payload before encryption, an authenticated Encrypted Pack Index, bounded authenticated Encrypted Pack Chunks, and one authoritative Encrypted Manifest.
-- [x] Pack Payload chunks obey the repository's fixed maximum plaintext chunk size, use ciphertext SHA-256 lowercase unpadded Base32 identifiers, and authenticate record kind, Repository ID, payload identity, chunk index, final marker, and plaintext length.
+- [x] Encrypted Pack Chunks obey the repository's fixed maximum plaintext chunk size, use ciphertext SHA-256 lowercase unpadded Base32 Opaque Segment Identifiers, and authenticate record kind, Repository ID, payload identity, chunk index, final marker, and plaintext length.
 - [x] Immutable ciphertext is uploaded before a single compare-and-swap Storage Ref publication, and any failure before that update leaves the previous Ciphertext Snapshot authoritative.
 - [x] Fresh recovery imports the native pack, restores Logical HEAD and the branch target, compares expected object IDs, runs `git fsck --full`, and produces the exact reachable Git object set from the source Logical Repository.
 - [x] The Repository Host exposes only `refs/heads/cloak-storage`, uses a constant non-sensitive Storage History commit message, and contains no original path, file content, branch name, or commit message in any reachable outer Git object.

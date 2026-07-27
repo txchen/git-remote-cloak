@@ -22,9 +22,9 @@ func TestCorruptRecoveryInputsLeaveNoUsablePlaintextCheckout(t *testing.T) {
 		{
 			name: "missing encrypted object",
 			mutate: func(t *testing.T, encoded *cloakformat.EncodedSnapshot) {
-				for locator := range encoded.Objects {
+				for locator := range encoded.CiphertextObjects {
 					if locator != encoded.ManifestLocator {
-						delete(encoded.Objects, locator)
+						delete(encoded.CiphertextObjects, locator)
 						return
 					}
 				}
@@ -35,7 +35,7 @@ func TestCorruptRecoveryInputsLeaveNoUsablePlaintextCheckout(t *testing.T) {
 			name: "chunk substitution",
 			mutate: func(t *testing.T, encoded *cloakformat.EncodedSnapshot) {
 				locators := make([]string, 0, 2)
-				for locator := range encoded.Objects {
+				for locator := range encoded.CiphertextObjects {
 					if locator != encoded.ManifestLocator {
 						locators = append(locators, locator)
 					}
@@ -43,14 +43,14 @@ func TestCorruptRecoveryInputsLeaveNoUsablePlaintextCheckout(t *testing.T) {
 				if len(locators) < 2 {
 					t.Fatal("fixture does not contain an index and chunk")
 				}
-				encoded.Objects[locators[0]] = encoded.Objects[locators[1]]
+				encoded.CiphertextObjects[locators[0]] = encoded.CiphertextObjects[locators[1]]
 			},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root, host, workspace, encoded, transport := preparedProtectedSnapshot(t, binary, false, false)
 			test.mutate(t, &encoded)
-			if _, err := transport.PublishSnapshot(encodedStorageParent(t, transport), encoded.Bootstrap, encoded.Objects); err != nil {
+			if _, err := transport.PublishSnapshot(encodedStorageParent(t, transport), encoded.Bootstrap, encoded.CiphertextObjects); err != nil {
 				t.Fatalf("publish corrupt fixture: %v", err)
 			}
 			assertCloneFailsWithoutDestination(t, binary, root, host, filepath.Join(root, "recovered"))
@@ -68,7 +68,7 @@ func TestCorruptRecoveryInputsLeaveNoUsablePlaintextCheckout(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root, host, _, encoded, transport := preparedProtectedSnapshot(t, binary, test.malformedIndex, test.corruptPack)
-			if _, err := transport.PublishSnapshot(encodedStorageParent(t, transport), encoded.Bootstrap, encoded.Objects); err != nil {
+			if _, err := transport.PublishSnapshot(encodedStorageParent(t, transport), encoded.Bootstrap, encoded.CiphertextObjects); err != nil {
 				t.Fatalf("publish corrupt fixture: %v", err)
 			}
 			assertCloneFailsWithoutDestination(t, binary, root, host, filepath.Join(root, "recovered"))
@@ -118,10 +118,10 @@ func preparedProtectedSnapshot(t *testing.T, binary string, malformedIndex, corr
 	}
 	commit := strings.TrimSpace(mustGit(t, workspace, "rev-parse", "HEAD"))
 	encoded, err = cloakformat.NewRegistry().EncodeSnapshot(recoverySecret, cloakformat.SnapshotInput{
-		Repository: cloakformat.Repository{
+		Repository: cloakformat.SnapshotState{
 			RepositoryID: empty.RepositoryID, Generation: 2, LogicalHEAD: empty.LogicalHEAD,
 			ObjectFormat: empty.ObjectFormat, LogicalRefs: map[string]string{"refs/heads/main": commit},
-			PreviousStorageRef: current.StorageID,
+			PreviousStorageRef: current.StorageCommitID,
 		},
 		Packs: []cloakformat.PackPayload{payload},
 	})

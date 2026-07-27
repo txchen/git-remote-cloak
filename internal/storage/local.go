@@ -15,12 +15,17 @@ import (
 
 const StorageRef = "refs/heads/cloak-storage"
 
+const (
+	maximumBootstrapBlobSize  = 16 + 64*1024
+	maximumCiphertextBlobSize = 32*1024*1024 + 28
+)
+
 // Snapshot is the byte representation read through the Storage Transport.
 type Snapshot struct {
-	Bootstrap []byte
-	Manifest  []byte
-	Objects   map[string][]byte
-	StorageID string
+	Bootstrap         []byte
+	Manifest          []byte
+	CiphertextObjects map[string][]byte
+	StorageCommitID   string
 }
 
 // LocalBare is a deterministic adapter for a local bare Repository Host.
@@ -86,18 +91,11 @@ func (transport *LocalBare) Current() (string, error) {
 
 // Read obtains the current complete Ciphertext Snapshot.
 func (transport *LocalBare) Read() (Snapshot, error) {
-	storageID, err := transport.Current()
+	bootstrap, storageID, err := transport.ReadBootstrap()
 	if err != nil {
 		return Snapshot{}, err
 	}
-	if storageID == transport.zeroObject {
-		return Snapshot{}, errors.New("Storage Ref does not exist")
-	}
-	bootstrap, err := runGit(transport.path, nil, "show", StorageRef+":bootstrap")
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("read Bootstrap Header: %w", err)
-	}
-	paths, err := runGit(transport.path, nil, "ls-tree", "-r", "--name-only", StorageRef, "objects")
+	paths, err := runGit(transport.path, nil, "ls-tree", "-r", "--name-only", storageID, "objects")
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("list encrypted manifest: %w", err)
 	}
@@ -110,13 +108,13 @@ func (transport *LocalBare) Read() (Snapshot, error) {
 		if !strings.HasPrefix(objectPath, "objects/") || strings.Count(objectPath, "/") != 1 {
 			return Snapshot{}, errors.New("Ciphertext Snapshot contains an invalid encrypted object path")
 		}
-		contents, err := runGit(transport.path, nil, "show", StorageRef+":"+objectPath)
+		contents, err := transport.ReadObject(storageID, strings.TrimPrefix(objectPath, "objects/"))
 		if err != nil {
 			return Snapshot{}, fmt.Errorf("read encrypted object: %w", err)
 		}
 		objects[strings.TrimPrefix(objectPath, "objects/")] = contents
 	}
-	snapshot := Snapshot{Bootstrap: bootstrap, Objects: objects, StorageID: storageID}
+	snapshot := Snapshot{Bootstrap: bootstrap, CiphertextObjects: objects, StorageCommitID: storageID}
 	if len(objects) == 1 {
 		for _, contents := range objects {
 			snapshot.Manifest = contents
@@ -125,23 +123,67 @@ func (transport *LocalBare) Read() (Snapshot, error) {
 	return snapshot, nil
 }
 
+// ReadBootstrap reads only the bounded public Bootstrap Header from one fixed Storage History commit.
+func (transport *LocalBare) ReadBootstrap() ([]byte, string, error) {
+	storageCommitID, err := transport.Current()
+	if err != nil {
+		return nil, "", err
+	}
+	if storageCommitID == transport.zeroObject {
+		return nil, "", errors.New("Storage Ref does not exist")
+	}
+	bootstrap, err := transport.readBoundedBlob(storageCommitID+":bootstrap", maximumBootstrapBlobSize)
+	if err != nil {
+		return nil, "", fmt.Errorf("read Bootstrap Header: %w", err)
+	}
+	return bootstrap, storageCommitID, nil
+}
+
+// ReadObject resolves one authenticated Opaque Segment Identifier from a fixed Storage History commit.
+func (transport *LocalBare) ReadObject(storageCommitID, locator string) ([]byte, error) {
+	if locator == "" || strings.Contains(locator, "/") {
+		return nil, errors.New("invalid Opaque Segment Identifier")
+	}
+	object, err := transport.readBoundedBlob(storageCommitID+":objects/"+locator, maximumCiphertextBlobSize)
+	if err != nil {
+		return nil, fmt.Errorf("read ciphertext object: %w", err)
+	}
+	return object, nil
+}
+
+func (transport *LocalBare) readBoundedBlob(revision string, maximumSize int) ([]byte, error) {
+	objectID, err := runGit(transport.path, nil, "rev-parse", "--verify", revision)
+	if err != nil {
+		return nil, err
+	}
+	sizeOutput, err := runGit(transport.path, nil, "cat-file", "-s", strings.TrimSpace(string(objectID)))
+	if err != nil {
+		return nil, err
+	}
+	var size int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(sizeOutput)), "%d", &size); err != nil || size < 0 || size > maximumSize {
+		return nil, errors.New("Ciphertext Repository blob exceeds its strict allocation limit")
+	}
+	return runGit(transport.path, nil, "cat-file", "blob", strings.TrimSpace(string(objectID)))
+}
+
 // PublishEmpty uploads immutable objects and compare-and-swap creates the Storage Ref.
 func (transport *LocalBare) PublishEmpty(bootstrap, manifest []byte, locator string) error {
 	_, err := transport.PublishSnapshot(transport.zeroObject, bootstrap, map[string][]byte{locator: manifest})
 	return err
 }
 
-// PublishSnapshot uploads immutable ciphertext before compare-and-swap publishing one Storage commit.
-func (transport *LocalBare) PublishSnapshot(expectedStorageID string, bootstrap []byte, objects map[string][]byte) (string, error) {
-	if len(objects) == 0 {
+// PublishSnapshot uploads immutable ciphertext before compare-and-swap publishing one Storage History commit.
+func (transport *LocalBare) PublishSnapshot(expectedStorageCommitID string, bootstrap []byte, ciphertextObjects map[string][]byte) (string, error) {
+	if len(ciphertextObjects) == 0 {
 		return "", errors.New("Ciphertext Snapshot contains no encrypted objects")
 	}
 	bootstrapOID, err := transport.writeBlob(bootstrap)
 	if err != nil {
 		return "", err
 	}
-	locators := make([]string, 0, len(objects))
-	for locator := range objects {
+	locators := make([]string, 0, len(ciphertextObjects))
+	for locator := range ciphertextObjects {
 		locators = append(locators, locator)
 	}
 	sort.Strings(locators)
@@ -150,7 +192,7 @@ func (transport *LocalBare) PublishSnapshot(expectedStorageID string, bootstrap 
 		if locator == "" || strings.Contains(locator, "/") {
 			return "", errors.New("invalid opaque ciphertext object locator")
 		}
-		objectID, err := transport.writeBlob(objects[locator])
+		objectID, err := transport.writeBlob(ciphertextObjects[locator])
 		if err != nil {
 			return "", err
 		}
@@ -166,15 +208,15 @@ func (transport *LocalBare) PublishSnapshot(expectedStorageID string, bootstrap 
 		return "", fmt.Errorf("build Ciphertext Snapshot tree: %w", err)
 	}
 	commitArguments := []string{"commit-tree", strings.TrimSpace(string(rootTree))}
-	if expectedStorageID != transport.zeroObject {
-		commitArguments = append(commitArguments, "-p", expectedStorageID)
+	if expectedStorageCommitID != transport.zeroObject {
+		commitArguments = append(commitArguments, "-p", expectedStorageCommitID)
 	}
 	commit, err := runGit(transport.path, []byte("cloak snapshot\n"), commitArguments...)
 	if err != nil {
-		return "", fmt.Errorf("build Storage commit: %w", err)
+		return "", fmt.Errorf("build Storage History commit: %w", err)
 	}
 	commitID := strings.TrimSpace(string(commit))
-	if _, err := runGit(transport.path, nil, "update-ref", StorageRef, commitID, expectedStorageID); err != nil {
+	if _, err := runGit(transport.path, nil, "update-ref", StorageRef, commitID, expectedStorageCommitID); err != nil {
 		return "", fmt.Errorf("compare-and-swap publish Storage Ref: %w", err)
 	}
 	return commitID, nil
