@@ -29,7 +29,7 @@ func TestInteractiveInitDisplaysMnemonicOnceAndRequiresConfirmation(t *testing.T
 		t.Fatal(err)
 	}
 	defer terminal.Close()
-	transcript := readPTYUntil(t, terminal, "type SAVED:")
+	transcript := readPTYUntil(t, terminal, "typing SAVED:")
 	if strings.Count(transcript, "cloak-v1:") != 1 {
 		t.Fatalf("Recovery Mnemonic appeared %d times before confirmation:\n%s", strings.Count(transcript, "cloak-v1:"), transcript)
 	}

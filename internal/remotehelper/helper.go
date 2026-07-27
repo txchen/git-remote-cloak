@@ -23,8 +23,14 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 	if err != nil {
 		return err
 	}
-	if err := atomicallyRecoverGitClone(repositoryEngine, repositoryURL, recoverySecret); err != nil {
-		return err
+	if len(repository.LogicalRefs) == 0 {
+		if err := secureEmptyGitCloneScaffold(); err != nil {
+			return err
+		}
+	} else {
+		if err := atomicallyRecoverGitClone(repositoryEngine, repositoryURL, recoverySecret); err != nil {
+			return err
+		}
 	}
 	if err := restoreMissingLogicalHEAD(repository.LogicalHEAD); err != nil {
 		return err
@@ -63,9 +69,6 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 			}
 		case command == "" && inFetchBatch:
 			inFetchBatch = false
-			if err := atomicallyRecoverGitClone(repositoryEngine, repositoryURL, recoverySecret); err != nil {
-				return err
-			}
 			gitDirectory, err := currentGitDirectory()
 			if err != nil {
 				return err
@@ -103,6 +106,11 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 			}
 			return writer.Flush()
 		case command == "":
+			if len(repository.LogicalRefs) == 0 {
+				if err := atomicallyRecoverGitClone(repositoryEngine, repositoryURL, recoverySecret); err != nil {
+					return err
+				}
+			}
 			return nil
 		case strings.HasPrefix(command, "fetch "):
 			inFetchBatch = true
@@ -120,6 +128,28 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 		}
 	}
 	return reader.Err()
+}
+
+func secureEmptyGitCloneScaffold() error {
+	gitDirectory, explicitlySet := os.LookupEnv("GIT_DIR")
+	if !explicitlySet {
+		return nil
+	}
+	absoluteGitDirectory, err := filepath.Abs(gitDirectory)
+	if err != nil || filepath.Base(absoluteGitDirectory) != ".git" {
+		return err
+	}
+	destination := filepath.Dir(absoluteGitDirectory)
+	entries, err := os.ReadDir(destination)
+	if err != nil {
+		return fmt.Errorf("inspect empty Git clone scaffold: %w", err)
+	}
+	if len(entries) == 1 && entries[0].Name() == ".git" && entries[0].IsDir() {
+		if err := os.Chmod(destination, 0o700); err != nil {
+			return fmt.Errorf("secure empty Git clone scaffold: %w", err)
+		}
+	}
+	return nil
 }
 
 type directPush struct {
