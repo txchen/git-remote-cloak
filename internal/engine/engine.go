@@ -211,6 +211,9 @@ func (engine *Engine) RecoverForGitClone(repositoryURL, destination string, secr
 	}
 	return localstate.PublishDirectory(destination, func(temporary string) error {
 		state := gitdb.State{LogicalHEAD: decoded.Repository.LogicalHEAD, ObjectFormat: decoded.Repository.ObjectFormat, LogicalRefs: decoded.Repository.LogicalRefs}
+		if err := gitdb.ValidateLogicalRepository(state, decoded.Packs); err != nil {
+			return err
+		}
 		if err := gitdb.RestoreForClone(temporary, state, decoded.Packs); err != nil {
 			return err
 		}
@@ -286,6 +289,9 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 			newObjectIDs = append(newObjectIDs, objectID)
 		}
 	}
+	if err := gitdb.RejectLFSPointers(logicalGitDirectory, newObjectIDs); err != nil {
+		return err
+	}
 	if len(newObjectIDs) > 0 {
 		payload, err := gitdb.CreatePackForObjects(logicalGitDirectory, newObjectIDs)
 		if err != nil {
@@ -338,8 +344,18 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 
 // FetchInto imports authenticated native packs into an existing Git object database.
 func (engine *Engine) FetchInto(repositoryURL, gitDirectory string, secret domain.RecoverySecret) error {
+	if err := gitdb.RejectPromisorState(gitDirectory); err != nil {
+		return err
+	}
 	decoded, err := engine.readSnapshot(repositoryURL, secret)
 	if err != nil {
+		return err
+	}
+	state := gitdb.State{
+		LogicalHEAD: decoded.Repository.LogicalHEAD, ObjectFormat: decoded.Repository.ObjectFormat,
+		LogicalRefs: decoded.Repository.LogicalRefs,
+	}
+	if err := gitdb.ValidateLogicalRepository(state, decoded.Packs); err != nil {
 		return err
 	}
 	return gitdb.Import(gitDirectory, decoded.Packs)
@@ -363,6 +379,9 @@ func (engine *Engine) PublishRef(repositoryURL, sourceGitDirectory, sourceRef, d
 func (engine *Engine) PublishRefs(repositoryURL, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret) error {
 	if len(updates) == 0 {
 		return errors.New("push transaction contains no Logical Ref updates")
+	}
+	if err := gitdb.RejectPromisorState(sourceGitDirectory); err != nil {
+		return err
 	}
 	temporaryRoot, err := os.MkdirTemp("", "git-remote-cloak-receive-")
 	if err != nil {

@@ -10,14 +10,27 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/txchen/git-remote-cloak/internal/domain"
 	"github.com/txchen/git-remote-cloak/internal/engine"
+	"github.com/txchen/git-remote-cloak/internal/gitdb"
 )
+
+type shallowFetchRequest struct {
+	depth     int
+	relative  bool
+	objectIDs []string
+}
 
 // Run serves one non-interactive Git remote-helper session.
 func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Reader, output io.Writer) error {
+	if gitDirectory, err := currentGitDirectory(); err == nil {
+		if err := gitdb.RejectPromisorState(gitDirectory); err != nil {
+			return err
+		}
+	}
 	repositoryEngine := engine.New()
 	repository, err := repositoryEngine.Inspect(repositoryURL, recoverySecret)
 	if err != nil {
@@ -38,6 +51,7 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 	reader := bufio.NewScanner(input)
 	writer := bufio.NewWriter(output)
 	inFetchBatch := false
+	shallowFetch := shallowFetchRequest{objectIDs: make([]string, 0, 1)}
 	pushes := make([]engine.RefUpdate, 0, 1)
 	for reader.Scan() {
 		command := reader.Text()
@@ -63,6 +77,33 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 			if _, err := fmt.Fprintf(writer, "@%s HEAD\n\n", repository.LogicalHEAD); err != nil {
 				return err
 			}
+		case strings.HasPrefix(command, "option filter ") ||
+			command == "option from-promisor true" || command == "option no-dependents true":
+			if _, err := fmt.Fprint(writer, "error partial clone filters and promisor objects are unsupported\n"); err != nil {
+				return err
+			}
+		case strings.HasPrefix(command, "option depth "):
+			depth, err := strconv.Atoi(strings.TrimPrefix(command, "option depth "))
+			if err != nil || depth < 1 {
+				if _, writeErr := fmt.Fprint(writer, "error shallow depth must be positive\n"); writeErr != nil {
+					return writeErr
+				}
+				break
+			}
+			shallowFetch.depth = depth
+			if _, err := fmt.Fprint(writer, "ok\n"); err != nil {
+				return err
+			}
+		case command == "option deepen-relative true":
+			shallowFetch.relative = true
+			if _, err := fmt.Fprint(writer, "ok\n"); err != nil {
+				return err
+			}
+		case command == "option deepen-relative false":
+			shallowFetch.relative = false
+			if _, err := fmt.Fprint(writer, "ok\n"); err != nil {
+				return err
+			}
 		case strings.HasPrefix(command, "option "):
 			if _, err := fmt.Fprint(writer, "unsupported\n"); err != nil {
 				return err
@@ -75,6 +116,11 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 			}
 			if err := repositoryEngine.FetchInto(repositoryURL, gitDirectory, recoverySecret); err != nil {
 				return err
+			}
+			if shallowFetch.depth > 0 {
+				if err := gitdb.SetShallowDepth(gitDirectory, shallowFetch.objectIDs, shallowFetch.depth, shallowFetch.relative); err != nil {
+					return err
+				}
 			}
 			if err := restoreLogicalHEAD(repository.LogicalHEAD); err != nil {
 				return err
@@ -112,6 +158,11 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 			return nil
 		case strings.HasPrefix(command, "fetch "):
 			inFetchBatch = true
+			fields := strings.Fields(command)
+			if len(fields) < 2 {
+				return errors.New("fetch requires an object ID")
+			}
+			shallowFetch.objectIDs = append(shallowFetch.objectIDs, fields[1])
 		case strings.HasPrefix(command, "push "):
 			push, err := parseRefUpdate(strings.TrimPrefix(command, "push "))
 			if err != nil {

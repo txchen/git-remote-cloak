@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -118,6 +119,17 @@ func RestoreForClone(destination string, state State, packs []cloakformat.PackPa
 	return nil
 }
 
+// ValidateLogicalRepository reconstructs the decoded logical state in isolation
+// and enforces supported-content rules before objects enter a caller's repository.
+func ValidateLogicalRepository(state State, packs []cloakformat.PackPayload) error {
+	temporaryRoot, err := os.MkdirTemp("", "git-remote-cloak-validation-")
+	if err != nil {
+		return fmt.Errorf("create Logical Repository validation directory: %w", err)
+	}
+	defer os.RemoveAll(temporaryRoot)
+	return Restore(filepath.Join(temporaryRoot, "repository.git"), true, state, packs)
+}
+
 func restore(destination string, bare, checkout bool, state State, packs []cloakformat.PackPayload) error {
 	gitDirectory, err := initializeAndImport(destination, bare, state, packs)
 	if err != nil {
@@ -152,6 +164,9 @@ func restore(destination string, bare, checkout bool, state State, packs []cloak
 		if _, exists := indexed[objectID]; !exists {
 			return errors.New("Recovered Repository reachable object set disagrees with Encrypted Pack Index")
 		}
+	}
+	if err := RejectLFSPointers(gitDirectory, gotObjects); err != nil {
+		return err
 	}
 	if _, err := run(gitDirectory, nil, "fsck", "--full"); err != nil {
 		return fmt.Errorf("validate Recovered Repository: %w", err)
@@ -243,21 +258,38 @@ func destinationGitDirectory(destination string, bare bool) string {
 	return destination + string(os.PathSeparator) + ".git"
 }
 
+type gitRunOptions struct {
+	additionalEnvironment []string
+	exitOneMeansMissing   bool
+}
+
 func run(gitDirectory string, stdin []byte, arguments ...string) ([]byte, error) {
+	output, _, err := runWithOptions(gitDirectory, stdin, gitRunOptions{}, arguments...)
+	return output, err
+}
+
+func runOptional(gitDirectory string, arguments ...string) ([]byte, bool, error) {
+	return runWithOptions(gitDirectory, nil, gitRunOptions{exitOneMeansMissing: true}, arguments...)
+}
+
+func runWithOptions(gitDirectory string, stdin []byte, options gitRunOptions, arguments ...string) ([]byte, bool, error) {
 	fullArguments := append([]string{"--git-dir=" + gitDirectory}, arguments...)
 	command := exec.Command("git", fullArguments...)
-	command.Env = cleanEnvironment()
+	command.Env = append(cleanEnvironment(), options.additionalEnvironment...)
 	if stdin != nil {
 		command.Stdin = bytes.NewReader(stdin)
 	}
 	output, err := command.Output()
-	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("git %s: %s", strings.Join(arguments, " "), strings.TrimSpace(string(exitError.Stderr)))
-		}
-		return nil, err
+	if err == nil {
+		return output, true, nil
 	}
-	return output, nil
+	if exitError, ok := err.(*exec.ExitError); ok && options.exitOneMeansMissing && exitError.ExitCode() == 1 {
+		return nil, false, nil
+	}
+	if exitError, ok := err.(*exec.ExitError); ok {
+		return nil, false, fmt.Errorf("git %s: %s", strings.Join(arguments, " "), strings.TrimSpace(string(exitError.Stderr)))
+	}
+	return nil, false, err
 }
 
 func cleanEnvironment() []string {

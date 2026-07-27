@@ -22,6 +22,7 @@ func TestSHA256ProtectedBranchRoundTrips(t *testing.T) {
 	mustGit(t, workspace, "add", ".")
 	mustGit(t, workspace, "commit", "-m", "sha256 protected commit")
 	wantCommit := mustGit(t, workspace, "rev-parse", "HEAD")
+	wantObjects := mustGit(t, workspace, "rev-list", "--objects", "HEAD")
 	mustInit(t, binary, workspace, host, testMnemonic)
 	push := exec.Command("git", "push", "backup", "main")
 	push.Dir = workspace
@@ -41,8 +42,14 @@ func TestSHA256ProtectedBranchRoundTrips(t *testing.T) {
 	if got := mustGit(t, humanRecovered, "rev-parse", "HEAD"); got != wantCommit {
 		t.Fatalf("human clone commit = %q, want %q", got, wantCommit)
 	}
+	if got := mustGit(t, humanRecovered, "rev-list", "--objects", "HEAD"); got != wantObjects {
+		t.Fatalf("human SHA-256 clone objects:\n%s\nwant:\n%s", got, wantObjects)
+	}
 	if got, err := os.ReadFile(filepath.Join(humanRecovered, "sha256.txt")); err != nil || string(got) != "sha256 protected object\n" {
 		t.Fatalf("human clone worktree was not recovered: contents=%q err=%v", got, err)
+	}
+	if output, err := exec.Command("git", "-C", humanRecovered, "fsck", "--full").CombinedOutput(); err != nil {
+		t.Fatalf("human SHA-256 clone fails fsck: %v\n%s", err, output)
 	}
 
 	gitClone := exec.Command("git", "clone", "cloak::"+host, helperRecovered)
@@ -60,4 +67,11 @@ func TestSHA256ProtectedBranchRoundTrips(t *testing.T) {
 	if got := mustGit(t, helperRecovered, "rev-parse", "HEAD"); got != wantCommit {
 		t.Fatalf("remote-helper clone commit = %q, want %q", got, wantCommit)
 	}
+	if got := mustGit(t, helperRecovered, "rev-list", "--objects", "HEAD"); got != wantObjects {
+		t.Fatalf("remote-helper SHA-256 clone objects:\n%s\nwant:\n%s", got, wantObjects)
+	}
+	if output, err := exec.Command("git", "-C", helperRecovered, "fsck", "--full").CombinedOutput(); err != nil {
+		t.Fatalf("remote-helper SHA-256 clone fails fsck: %v\n%s", err, output)
+	}
+	assertProtectedPlaintextAbsent(t, host, "sha256.txt", "sha256 protected object", "sha256 protected commit")
 }
