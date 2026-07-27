@@ -78,6 +78,8 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 		return errors.New("existing Ciphertext Repository requires a matching configured remote and Repository ID")
 	}
 	var repository cloakformat.EmptyRepository
+	var storageCommitID string
+	var generation uint64
 	switch {
 	case len(refs) == 0:
 		if hasConfiguredRepositoryID {
@@ -96,11 +98,17 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 		if err != nil {
 			return err
 		}
-		if err := transport.PublishEmpty(encoded.Bootstrap, encoded.Manifest, encoded.ManifestLocator); err != nil {
+		expectedStorageCommitID, err := transport.Current()
+		if err != nil {
 			return err
 		}
+		storageCommitID, err = transport.PublishSnapshot(expectedStorageCommitID, encoded.Bootstrap, map[string][]byte{encoded.ManifestLocator: encoded.Manifest})
+		if err != nil {
+			return err
+		}
+		generation = 1
 	case len(refs) == 1 && refs[0] == storage.StorageRef:
-		decoded, _, err := engine.decodeTransportSnapshot(secret, transport)
+		decoded, currentStorageCommitID, err := engine.decodeTransportSnapshot(secret, transport)
 		if err != nil {
 			return errors.New("existing Ciphertext Repository has another Cloak identity")
 		}
@@ -108,6 +116,8 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 			RepositoryID: decoded.Repository.RepositoryID, LogicalHEAD: decoded.Repository.LogicalHEAD,
 			ObjectFormat: decoded.Repository.ObjectFormat,
 		}
+		storageCommitID = currentStorageCommitID
+		generation = decoded.Repository.Generation
 		if repository.LogicalHEAD != domain.LogicalHEAD(logicalHEADName) {
 			return errors.New("existing Ciphertext Repository Logical HEAD does not match")
 		}
@@ -124,6 +134,11 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 	}
 	if _, err := git(workspace, nil, "config", "remote."+remoteName+".cloakRepositoryID", hex.EncodeToString(repository.RepositoryID[:])); err != nil {
 		return fmt.Errorf("record public Repository ID: %w", err)
+	}
+	if engine.localGitDirectory != "" {
+		if err := localstate.ObserveCheckpoint(engine.localGitDirectory, repository.RepositoryID, generation, storageCommitID, "", transport.StorageHistoryContinues); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -145,6 +160,11 @@ func (engine *Engine) SetHead(workspace, remoteName, branch string, secret domai
 	if !found || repositoryURL == "" {
 		return errors.New("configured remote is not a Cloak remote")
 	}
+	operationLock, err := localstate.AcquireOperationLock(engine.localGitDirectory)
+	if err != nil {
+		return err
+	}
+	defer operationLock.Close()
 	transport, err := storage.OpenGit(repositoryURL)
 	if err != nil {
 		return err
@@ -169,8 +189,12 @@ func (engine *Engine) SetHead(workspace, remoteName, branch string, secret domai
 	if candidate.Repository.LogicalHEAD != repository.LogicalHEAD || !maps.Equal(candidate.Repository.LogicalRefs, repository.LogicalRefs) {
 		return errors.New("candidate Ciphertext Snapshot does not preserve the intended Logical HEAD state")
 	}
-	_, err = transport.PublishSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
-	return err
+	publishedStorageCommitID, err := transport.PublishSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
+	if err != nil {
+		return err
+	}
+	return localstate.ObserveCheckpoint(engine.localGitDirectory, candidate.Repository.RepositoryID, candidate.Repository.Generation,
+		publishedStorageCommitID, candidate.Repository.PreviousStorageRef, transport.StorageHistoryContinues)
 }
 
 // Recover atomically creates and validates a complete Recovered Repository.
@@ -196,7 +220,40 @@ func (engine *Engine) Recover(repositoryURL, destination string, secret domain.R
 		if _, err := git(temporary, nil, "fsck", "--full"); err != nil {
 			return fmt.Errorf("validate Recovered Repository: %w", err)
 		}
+		if err := recordRecoveredCheckpoint(temporary, decoded); err != nil {
+			return err
+		}
 		return nil
+	})
+}
+
+// RecoverHistorical explicitly reconstructs one retained authenticated
+// Storage History generation into a separate local repository.
+func (engine *Engine) RecoverHistorical(repositoryURL, storageCommitID, destination string, secret domain.RecoverySecret) error {
+	if destination == "" {
+		return errors.New("historical recovery requires a separate destination")
+	}
+	if !validStorageCommitID(storageCommitID) {
+		return errors.New("historical recovery requires a complete Storage Ref object ID")
+	}
+	transport, err := storage.OpenGit(repositoryURL)
+	if err != nil {
+		return err
+	}
+	defer transport.Close()
+	currentStorageCommitID, err := transport.Current()
+	if err != nil {
+		return err
+	}
+	if !transport.StorageHistoryContinues(storageCommitID, currentStorageCommitID) {
+		return errors.New("requested Storage Ref is not retained in current Storage History")
+	}
+	decoded, err := engine.decodeTransportSnapshotAt(secret, transport, storageCommitID, false)
+	if err != nil {
+		return fmt.Errorf("authenticate historical Ciphertext Snapshot: %w", err)
+	}
+	return engine.recoverDecoded(repositoryURL, destination, authenticatedSnapshot{
+		DecodedSnapshot: decoded, StorageCommitID: storageCommitID,
 	})
 }
 
@@ -227,6 +284,9 @@ func (engine *Engine) RecoverForGitClone(repositoryURL, destination string, secr
 		}
 		if _, err := git(temporary, nil, "remote", "add", "origin", "cloak::"+repositoryURL); err != nil {
 			return fmt.Errorf("configure recovered origin: %w", err)
+		}
+		if err := recordRecoveredCheckpoint(temporary, decoded); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -259,6 +319,10 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 	if err != nil {
 		return err
 	}
+	return engine.publishCurrent(transport, current, storageCommitID, logicalGitDirectory, secret)
+}
+
+func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat.DecodedSnapshot, storageCommitID, logicalGitDirectory string, secret domain.RecoverySecret) error {
 	state, err := gitdb.ReadState(logicalGitDirectory)
 	if err != nil {
 		return err
@@ -365,6 +429,9 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 	if err := transport.PublishPrepared(storageCommitID, preparedStorageCommit); err != nil {
 		return err
 	}
+	if err := localstate.ObserveCheckpoint(engine.localGitDirectory, candidate.Repository.RepositoryID, candidate.Repository.Generation, preparedStorageCommit, candidate.Repository.PreviousStorageRef, transport.StorageHistoryContinues); err != nil {
+		return fmt.Errorf("record confirmed publication checkpoint: %w", err)
+	}
 	if err := localstate.RemoveTransaction(engine.localGitDirectory, intentID); err != nil {
 		return fmt.Errorf("remove completed crash journal: %w", err)
 	}
@@ -392,9 +459,11 @@ func (engine *Engine) FetchInto(repositoryURL, gitDirectory string, secret domai
 
 // RefUpdate is one requested Logical Ref change in an atomic push transaction.
 type RefUpdate struct {
-	Source      domain.LogicalRefName
-	Destination domain.LogicalRefName
-	Force       bool
+	Source         domain.LogicalRefName
+	Destination    domain.LogicalRefName
+	Force          bool
+	ExpectedOld    string
+	HasExpectedOld bool
 }
 
 // PublishRef applies one direct remote-helper ref update.
@@ -412,19 +481,64 @@ func (engine *Engine) PublishRefs(repositoryURL, sourceGitDirectory string, upda
 	if err := gitdb.RejectPromisorState(sourceGitDirectory); err != nil {
 		return err
 	}
+	lockDirectory := engine.localGitDirectory
+	if lockDirectory == "" {
+		lockDirectory = sourceGitDirectory
+	}
+	operationLock, err := localstate.AcquireOperationLock(lockDirectory)
+	if err != nil {
+		return err
+	}
+	defer operationLock.Close()
+
+	var concurrentErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		concurrentErr = engine.publishRefAttempt(repositoryURL, sourceGitDirectory, updates, secret)
+		if concurrentErr == nil {
+			return nil
+		}
+		if !errors.Is(concurrentErr, storage.ErrConcurrentUpdate) {
+			return concurrentErr
+		}
+	}
+	return fmt.Errorf("compatible concurrent publication did not succeed after 3 attempts: %w", concurrentErr)
+}
+
+func (engine *Engine) publishRefAttempt(repositoryURL, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret) error {
+	transport, err := storage.OpenGit(repositoryURL)
+	if err != nil {
+		return err
+	}
+	defer transport.Close()
+	current, storageCommitID, err := engine.decodeTransportSnapshot(secret, transport)
+	if err != nil {
+		return err
+	}
 	temporaryRoot, err := os.MkdirTemp("", "git-remote-cloak-receive-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(temporaryRoot)
 	temporary := filepath.Join(temporaryRoot, "repository.git")
-	if err := engine.RecoverBare(repositoryURL, temporary, secret); err != nil {
-		return err
+	if len(current.Repository.LogicalRefs) == 0 {
+		if _, err := makeEmptyBare(temporary, current.Repository); err != nil {
+			return err
+		}
+	} else {
+		if err := gitdb.Restore(temporary, true, gitdb.State{
+			LogicalHEAD: current.Repository.LogicalHEAD, ObjectFormat: current.Repository.ObjectFormat,
+			LogicalRefs: current.Repository.LogicalRefs,
+		}, current.Packs); err != nil {
+			return err
+		}
 	}
 	for _, update := range updates {
 		source, destination := string(update.Source), string(update.Destination)
 		if !update.Destination.IsSupported() || source != "" && !strings.HasPrefix(source, "refs/") {
 			return errors.New("push requires branch or tag refs")
+		}
+		if update.HasExpectedOld && current.Repository.LogicalRefs[destination] != update.ExpectedOld {
+			return fmt.Errorf("stale force-with-lease for Logical Ref %s", destination)
 		}
 		if source == "" {
 			if _, err := git(temporary, nil, "update-ref", "-d", destination); err != nil {
@@ -442,7 +556,7 @@ func (engine *Engine) PublishRefs(repositoryURL, sourceGitDirectory string, upda
 			return fmt.Errorf("receive pushed Logical Ref: %s", strings.TrimSpace(string(output)))
 		}
 	}
-	return engine.Publish(repositoryURL, temporary, secret)
+	return engine.publishCurrent(transport, current, storageCommitID, temporary, secret)
 }
 
 // InspectEmpty authenticates and returns the logical state for a remote-helper adapter.
@@ -466,21 +580,26 @@ func (engine *Engine) Inspect(repositoryURL string, secret domain.RecoverySecret
 	return decoded.Repository, err
 }
 
-func (engine *Engine) readSnapshot(repositoryURL string, secret domain.RecoverySecret) (cloakformat.DecodedSnapshot, error) {
+type authenticatedSnapshot struct {
+	cloakformat.DecodedSnapshot
+	StorageCommitID string
+}
+
+func (engine *Engine) readSnapshot(repositoryURL string, secret domain.RecoverySecret) (authenticatedSnapshot, error) {
 	transport, err := storage.OpenGit(repositoryURL)
 	if err != nil {
-		return cloakformat.DecodedSnapshot{}, err
+		return authenticatedSnapshot{}, err
 	}
 	defer transport.Close()
 	refs, err := transport.Refs()
 	if err != nil {
-		return cloakformat.DecodedSnapshot{}, err
+		return authenticatedSnapshot{}, err
 	}
 	if len(refs) != 1 || refs[0] != storage.StorageRef {
-		return cloakformat.DecodedSnapshot{}, errors.New("Repository Host does not expose exactly one Storage Ref")
+		return authenticatedSnapshot{}, errors.New("Repository Host does not expose exactly one Storage Ref")
 	}
-	decoded, _, err := engine.decodeTransportSnapshot(secret, transport)
-	return decoded, err
+	decoded, storageCommitID, err := engine.decodeTransportSnapshot(secret, transport)
+	return authenticatedSnapshot{DecodedSnapshot: decoded, StorageCommitID: storageCommitID}, err
 }
 
 func (engine *Engine) decodeTransportSnapshot(secret domain.RecoverySecret, transport *storage.Git) (cloakformat.DecodedSnapshot, string, error) {
@@ -488,6 +607,19 @@ func (engine *Engine) decodeTransportSnapshot(secret domain.RecoverySecret, tran
 	if err != nil {
 		return cloakformat.DecodedSnapshot{}, "", err
 	}
+	decoded, err := engine.decodeTransportSnapshotBytes(secret, transport, bootstrap, storageCommitID, true)
+	return decoded, storageCommitID, err
+}
+
+func (engine *Engine) decodeTransportSnapshotAt(secret domain.RecoverySecret, transport *storage.Git, storageCommitID string, observe bool) (cloakformat.DecodedSnapshot, error) {
+	bootstrap, err := transport.ReadBootstrapAt(storageCommitID)
+	if err != nil {
+		return cloakformat.DecodedSnapshot{}, err
+	}
+	return engine.decodeTransportSnapshotBytes(secret, transport, bootstrap, storageCommitID, observe)
+}
+
+func (engine *Engine) decodeTransportSnapshotBytes(secret domain.RecoverySecret, transport *storage.Git, bootstrap []byte, storageCommitID string, observe bool) (cloakformat.DecodedSnapshot, error) {
 	cache := localstate.NewCache(engine.localGitDirectory)
 	downloaded := make(map[string][]byte)
 	decoded, err := engine.formats.DecodeSnapshotFrom(secret, bootstrap, func(locator string) ([]byte, error) {
@@ -501,12 +633,24 @@ func (engine *Engine) decodeTransportSnapshot(secret domain.RecoverySecret, tran
 		return contents, err
 	})
 	if err != nil {
-		return cloakformat.DecodedSnapshot{}, "", err
+		return cloakformat.DecodedSnapshot{}, err
+	}
+	if observe {
+		state := gitdb.State{
+			LogicalHEAD: decoded.Repository.LogicalHEAD, ObjectFormat: decoded.Repository.ObjectFormat,
+			LogicalRefs: decoded.Repository.LogicalRefs,
+		}
+		if err := gitdb.ValidateLogicalRepository(state, decoded.Packs); err != nil {
+			return cloakformat.DecodedSnapshot{}, err
+		}
+		if err := localstate.ObserveCheckpoint(engine.localGitDirectory, decoded.Repository.RepositoryID, decoded.Repository.Generation, storageCommitID, decoded.Repository.PreviousStorageRef, transport.StorageHistoryContinues); err != nil {
+			return cloakformat.DecodedSnapshot{}, err
+		}
 	}
 	// Cache failure can reduce performance but cannot change recoverability.
 	_ = cache.StoreSnapshot(storageCommitID, bootstrap, downloaded)
 	localstate.ReconcileTransactions(engine.localGitDirectory, secret, decoded.Repository.RepositoryID, storageCommitID, transport.ContainsStorageCommit)
-	return decoded, storageCommitID, nil
+	return decoded, nil
 }
 
 func canonicalTransactionIntent(state gitdb.State) []byte {
@@ -529,7 +673,7 @@ func canonicalTransactionIntent(state gitdb.State) []byte {
 	return []byte(canonical.String())
 }
 
-func (engine *Engine) recoverDecoded(repositoryURL, destination string, decoded cloakformat.DecodedSnapshot) error {
+func (engine *Engine) recoverDecoded(repositoryURL, destination string, decoded authenticatedSnapshot) error {
 	if destination == "" {
 		destination = defaultDestination(repositoryURL)
 	}
@@ -541,8 +685,16 @@ func (engine *Engine) recoverDecoded(repositoryURL, destination string, decoded 
 		if _, err := git(temporary, nil, "remote", "add", "origin", "cloak::"+repositoryURL); err != nil {
 			return fmt.Errorf("configure recovered origin: %w", err)
 		}
+		if err := recordRecoveredCheckpoint(temporary, decoded); err != nil {
+			return err
+		}
 		return nil
 	})
+}
+
+func recordRecoveredCheckpoint(repositoryDirectory string, decoded authenticatedSnapshot) error {
+	return localstate.ObserveCheckpoint(filepath.Join(repositoryDirectory, ".git"), decoded.Repository.RepositoryID,
+		decoded.Repository.Generation, decoded.StorageCommitID, decoded.Repository.PreviousStorageRef, nil)
 }
 
 func makeEmptyBare(destination string, repository cloakformat.SnapshotState) (string, error) {
@@ -557,6 +709,14 @@ func makeEmptyBare(destination string, repository cloakformat.SnapshotState) (st
 func defaultDestination(repositoryURL string) string {
 	base := filepath.Base(strings.TrimSuffix(repositoryURL, "/"))
 	return strings.TrimSuffix(base, ".git")
+}
+
+func validStorageCommitID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil && value == strings.ToLower(value)
 }
 
 func git(directory string, stdin []byte, arguments ...string) ([]byte, error) {

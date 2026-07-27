@@ -35,8 +35,12 @@ func run(arguments []string) error {
 		return runInit(arguments[1:])
 	case "clone":
 		return runClone(arguments[1:])
+	case "doctor":
+		return runDoctor(arguments[1:])
 	case "cache":
 		return runCache(arguments[1:])
+	case "status":
+		return runStatus(arguments[1:])
 	case "set-head":
 		return runSetHead(arguments[1:])
 	default:
@@ -67,6 +71,84 @@ func runCache(arguments []string) error {
 	return nil
 }
 
+func runStatus(arguments []string) error {
+	structured := len(arguments) == 1 && arguments[0] == "--json"
+	if len(arguments) != 0 && !structured {
+		return fmt.Errorf("usage: git-remote-cloak status [--json]")
+	}
+	gitDirectory, err := absoluteGitDirectory()
+	if err != nil {
+		return fmt.Errorf("status must run inside a Git repository")
+	}
+	checkpoint, exists, err := localstate.LoadCheckpoint(gitDirectory)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("no trusted Rollback Checkpoint exists for this Logical Repository")
+	}
+	status := struct {
+		RepositoryID                   string `json:"repository_id"`
+		HighestAuthenticatedGeneration uint64 `json:"highest_authenticated_generation"`
+		LastSeenStorageCommitID        string `json:"last_seen_storage_commit_id"`
+		Freshness                      string `json:"freshness"`
+	}{
+		RepositoryID: checkpoint.RepositoryID, HighestAuthenticatedGeneration: checkpoint.HighestAuthenticatedGeneration,
+		LastSeenStorageCommitID: checkpoint.LastSeenStorageCommitID, Freshness: "protects_future_observations_only",
+	}
+	if structured {
+		return json.NewEncoder(os.Stdout).Encode(status)
+	}
+	fmt.Printf("Repository ID: %s\nHighest authenticated generation: %d\nLast-seen Storage Ref target commit: %s\nFreshness: protects future observations only; it cannot prove the first observed snapshot was newest.\n",
+		status.RepositoryID, status.HighestAuthenticatedGeneration, status.LastSeenStorageCommitID)
+	return nil
+}
+
+func runDoctor(arguments []string) error {
+	structured := false
+	positional := make([]string, 0, 1)
+	for _, argument := range arguments {
+		if argument == "--json" && !structured {
+			structured = true
+			continue
+		}
+		if strings.HasPrefix(argument, "-") {
+			return fmt.Errorf("usage: git-remote-cloak doctor <repository-url> [--json]")
+		}
+		positional = append(positional, argument)
+	}
+	if len(positional) != 1 {
+		return fmt.Errorf("usage: git-remote-cloak doctor <repository-url> [--json]")
+	}
+	recoverySecret, err := acquireSecret("", false)
+	if err != nil {
+		return err
+	}
+	repositoryEngine := engine.New()
+	if gitDirectory := localStateForRepositoryURL(positional[0]); gitDirectory != "" {
+		repositoryEngine = engine.NewWithLocalState(gitDirectory)
+	}
+	report, diagnosticErr := repositoryEngine.Doctor(positional[0], recoverySecret)
+	if structured {
+		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
+			return err
+		}
+	} else {
+		for _, check := range report.Checks {
+			fmt.Printf("%s: %s", check.Name, check.Status)
+			if check.Detail != "" {
+				fmt.Printf(" — %s", check.Detail)
+			}
+			fmt.Println()
+		}
+		fmt.Printf("Freshness: %s\n", report.Freshness)
+	}
+	if diagnosticErr != nil {
+		return fmt.Errorf("doctor found repository integrity problems")
+	}
+	return nil
+}
+
 func runSetHead(arguments []string) error {
 	if len(arguments) != 2 {
 		return fmt.Errorf("usage: git-remote-cloak set-head <remote-name> <branch>")
@@ -79,7 +161,11 @@ func runSetHead(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	if err := engine.New().SetHead(workspace, arguments[0], arguments[1], recoverySecret); err != nil {
+	gitDirectory, err := absoluteGitDirectory()
+	if err != nil {
+		return err
+	}
+	if err := engine.NewWithLocalState(gitDirectory).SetHead(workspace, arguments[0], arguments[1], recoverySecret); err != nil {
 		return err
 	}
 	fmt.Printf("Logical HEAD now selects refs/heads/%s.\n", strings.TrimPrefix(arguments[1], "refs/heads/"))
@@ -128,7 +214,11 @@ func runInit(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	if err := engine.New().Initialize(workspace, positional[0], positional[1], defaultBranch, recoverySecret); err != nil {
+	gitDirectory, err := absoluteGitDirectory()
+	if err != nil {
+		return err
+	}
+	if err := engine.NewWithLocalState(gitDirectory).Initialize(workspace, positional[0], positional[1], defaultBranch, recoverySecret); err != nil {
 		return err
 	}
 	fmt.Printf("Initialized Ciphertext Repository for remote %s.\n", positional[0])
@@ -136,9 +226,9 @@ func runInit(arguments []string) error {
 }
 
 func runClone(arguments []string) error {
-	positional, secretFile, _, err := parseArguments(arguments, false)
+	positional, secretFile, storageCommitID, err := parseCloneArguments(arguments)
 	if err != nil || len(positional) < 1 || len(positional) > 2 {
-		return fmt.Errorf("usage: git-remote-cloak clone <repository-url> [directory] [--secret-file PATH]")
+		return fmt.Errorf("usage: git-remote-cloak clone <repository-url> [directory] [--secret-file PATH] [--storage-commit OBJECT-ID]")
 	}
 	recoverySecret, err := acquireSecret(secretFile, false)
 	if err != nil {
@@ -148,11 +238,45 @@ func runClone(arguments []string) error {
 	if len(positional) == 2 {
 		destination = positional[1]
 	}
-	if err := engine.New().Recover(positional[0], destination, recoverySecret); err != nil {
-		return err
+	if storageCommitID != "" && destination == "" {
+		return fmt.Errorf("historical recovery with --storage-commit requires a separate destination")
+	}
+	var recoverErr error
+	if storageCommitID == "" {
+		recoverErr = engine.New().Recover(positional[0], destination, recoverySecret)
+	} else {
+		recoverErr = engine.New().RecoverHistorical(positional[0], storageCommitID, destination, recoverySecret)
+	}
+	if recoverErr != nil {
+		return recoverErr
 	}
 	fmt.Println("Recovered Logical Repository.")
 	return nil
+}
+
+func parseCloneArguments(arguments []string) (positional []string, secretFile, storageCommitID string, err error) {
+	for index := 0; index < len(arguments); index++ {
+		switch arguments[index] {
+		case "--secret-file":
+			index++
+			if index >= len(arguments) || secretFile != "" {
+				return nil, "", "", usageError()
+			}
+			secretFile = arguments[index]
+		case "--storage-commit":
+			index++
+			if index >= len(arguments) || storageCommitID != "" {
+				return nil, "", "", usageError()
+			}
+			storageCommitID = arguments[index]
+		default:
+			if strings.HasPrefix(arguments[index], "-") {
+				return nil, "", "", usageError()
+			}
+			positional = append(positional, arguments[index])
+		}
+	}
+	return positional, secretFile, storageCommitID, nil
 }
 
 func parseArguments(arguments []string, allowDefaultBranch bool) (positional []string, secretFile, defaultBranch string, err error) {
@@ -214,5 +338,34 @@ func acquireSecret(explicitFile string, allowGeneration bool) (domain.RecoverySe
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: git-remote-cloak <init|clone|cache|set-head|version>")
+	return fmt.Errorf("usage: git-remote-cloak <init|clone|cache|doctor|set-head|status|version>")
+}
+
+func absoluteGitDirectory() (string, error) {
+	command := exec.Command("git", "rev-parse", "--absolute-git-dir")
+	output, err := command.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func localStateForRepositoryURL(repositoryURL string) string {
+	gitDirectory, err := absoluteGitDirectory()
+	if err != nil {
+		return ""
+	}
+	command := exec.Command("git", "config", "--get-regexp", `^remote\..*\.url$`)
+	output, err := command.Output()
+	if err != nil {
+		return ""
+	}
+	wanted := "cloak::" + repositoryURL
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		_, configuredURL, found := strings.Cut(line, " ")
+		if found && configuredURL == wanted {
+			return gitDirectory
+		}
+	}
+	return ""
 }

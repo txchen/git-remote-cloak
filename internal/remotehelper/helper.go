@@ -50,6 +50,7 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 	partialCloneRejected := false
 	shallowFetch := shallowFetchRequest{objectIDs: make([]string, 0, 1)}
 	pushes := make([]engine.RefUpdate, 0, 1)
+	leases := make(map[string]string)
 	for reader.Scan() {
 		command := reader.Text()
 		switch {
@@ -114,6 +115,22 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 			}
 		case command == "option cloning false":
 			cloning = false
+			if _, err := fmt.Fprint(writer, "ok\n"); err != nil {
+				return err
+			}
+		case command == "option atomic true":
+			if _, err := fmt.Fprint(writer, "ok\n"); err != nil {
+				return err
+			}
+		case strings.HasPrefix(command, "option cas "):
+			logicalRef, expected, found := strings.Cut(strings.TrimPrefix(command, "option cas "), ":")
+			if !found || !domain.LogicalRefName(logicalRef).IsSupported() {
+				if _, err := fmt.Fprint(writer, "error invalid force-with-lease expectation\n"); err != nil {
+					return err
+				}
+				break
+			}
+			leases[logicalRef] = expected
 			if _, err := fmt.Fprint(writer, "ok\n"); err != nil {
 				return err
 			}
@@ -189,6 +206,10 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 			push, err := parseRefUpdate(strings.TrimPrefix(command, "push "))
 			if err != nil {
 				return err
+			}
+			if expected, found := leases[string(push.Destination)]; found {
+				push.ExpectedOld = expected
+				push.HasExpectedOld = true
 			}
 			pushes = append(pushes, push)
 		default:

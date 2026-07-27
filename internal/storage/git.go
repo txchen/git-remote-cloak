@@ -15,6 +15,10 @@ type Git struct {
 	temporaryRoot string
 }
 
+// ErrConcurrentUpdate reports that another writer changed the Storage Ref
+// after this transport read it.
+var ErrConcurrentUpdate = errors.New("Storage Ref changed concurrently")
+
 // OpenGit clones the Repository Host through ordinary Git transport into restrictive local storage.
 func OpenGit(repositoryURL string) (*Git, error) {
 	if repositoryURL == "" {
@@ -86,6 +90,9 @@ func (transport *Git) PublishPrepared(expectedStorageCommitID, commitID string) 
 			return nil
 		} else {
 			lastError = err
+			if concurrentPushError(err.Error()) {
+				return fmt.Errorf("%w: %v", ErrConcurrentUpdate, err)
+			}
 			if nonRetryablePushError(err.Error()) {
 				break
 			}
@@ -94,10 +101,27 @@ func (transport *Git) PublishPrepared(expectedStorageCommitID, commitID string) 
 	return fmt.Errorf("compare-and-swap publish Storage Ref through ordinary Git transport failed after at most 3 attempts: %w", lastError)
 }
 
+func concurrentPushError(message string) bool {
+	lower := strings.ToLower(message)
+	for _, fragment := range []string{"stale info", "incorrect old value", "but expected"} {
+		if strings.Contains(lower, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 // ContainsStorageCommit reports whether a commit is retained in the fetched
 // Storage History.
 func (transport *Git) ContainsStorageCommit(storageCommitID string) bool {
 	_, err := runGit(transport.path, nil, "cat-file", "-e", storageCommitID+"^{commit}")
+	return err == nil
+}
+
+// StorageHistoryContinues reports whether newerStorageCommitID descends from
+// the previously trusted Storage History commit.
+func (transport *Git) StorageHistoryContinues(previousStorageCommitID, newerStorageCommitID string) bool {
+	_, err := runGit(transport.path, nil, "merge-base", "--is-ancestor", previousStorageCommitID, newerStorageCommitID)
 	return err == nil
 }
 

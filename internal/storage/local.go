@@ -132,11 +132,18 @@ func (transport *LocalBare) ReadBootstrap() ([]byte, string, error) {
 	if storageCommitID == transport.zeroObject {
 		return nil, "", errors.New("Storage Ref does not exist")
 	}
+	bootstrap, err := transport.ReadBootstrapAt(storageCommitID)
+	return bootstrap, storageCommitID, err
+}
+
+// ReadBootstrapAt reads the bounded Bootstrap Header from one explicit
+// retained Storage History commit without changing the Storage Ref.
+func (transport *LocalBare) ReadBootstrapAt(storageCommitID string) ([]byte, error) {
 	bootstrap, err := transport.readBoundedBlob(storageCommitID+":bootstrap", maximumBootstrapBlobSize)
 	if err != nil {
-		return nil, "", fmt.Errorf("read Bootstrap Header: %w", err)
+		return nil, fmt.Errorf("read Bootstrap Header: %w", err)
 	}
-	return bootstrap, storageCommitID, nil
+	return bootstrap, nil
 }
 
 // ReadObject resolves one authenticated Opaque Segment Identifier from a fixed Storage History commit.
@@ -235,7 +242,7 @@ func (transport *LocalBare) PrepareSnapshot(expectedStorageCommitID string, boot
 // PublishPrepared atomically changes the Storage Ref to a prepared commit.
 func (transport *LocalBare) PublishPrepared(expectedStorageCommitID, commitID string) error {
 	if _, err := runGit(transport.path, nil, "update-ref", StorageRef, commitID, expectedStorageCommitID); err != nil {
-		return fmt.Errorf("compare-and-swap publish Storage Ref: %w", err)
+		return fmt.Errorf("%w: compare-and-swap publish Storage Ref: %v", ErrConcurrentUpdate, err)
 	}
 	return nil
 }
