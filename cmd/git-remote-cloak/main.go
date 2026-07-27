@@ -107,10 +107,10 @@ func runClone(arguments []string) error {
 	if len(positional) == 2 {
 		destination = positional[1]
 	}
-	if err := engine.New().RecoverEmpty(positional[0], destination, recoverySecret); err != nil {
+	if err := engine.New().Recover(positional[0], destination, recoverySecret); err != nil {
 		return err
 	}
-	fmt.Println("Recovered empty Logical Repository.")
+	fmt.Println("Recovered Logical Repository.")
 	return nil
 }
 

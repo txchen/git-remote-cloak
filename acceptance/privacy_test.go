@@ -40,6 +40,18 @@ func TestReachableCiphertextRepositoryObjectsContainNoProtectedPlaintext(t *test
 	if got := mustGit(t, workspace, "rev-parse", "HEAD"); got != logicalCommit {
 		t.Fatalf("init changed local Logical Ref from %q to %q", logicalCommit, got)
 	}
+	push := exec.Command("git", "push", "backup", "main")
+	push.Dir = workspace
+	push.Env = cloakGitEnvironment(binary)
+	if output, err := push.CombinedOutput(); err != nil {
+		t.Fatalf("push failed: %v\n%s", err, output)
+	}
+	if got := mustGit(t, host, "for-each-ref", "--format=%(refname)"); got != "refs/heads/cloak-storage\n" {
+		t.Fatalf("Repository Host refs = %q", got)
+	}
+	if got := mustGit(t, host, "log", "--format=%s", "--all"); strings.TrimSpace(got) != "cloak snapshot\ncloak snapshot" {
+		t.Fatalf("Storage History messages = %q", got)
+	}
 
 	reachable := mustGit(t, host, "rev-list", "--objects", "--all")
 	var inspected bytes.Buffer

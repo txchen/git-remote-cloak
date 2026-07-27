@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -42,6 +43,115 @@ func TestV1EmptySnapshotRoundTripsThroughRegistry(t *testing.T) {
 	if got != want {
 		t.Fatalf("decoded empty repository = %+v, want %+v", got, want)
 	}
+}
+
+func TestV1PackPayloadRoundTripsWithOpaqueAuthenticatedRecords(t *testing.T) {
+	registry := cloakformat.NewRegistry()
+	input := cloakformat.SnapshotInput{
+		Repository: cloakformat.Repository{
+			RepositoryID: testRepositoryID, Generation: 2, LogicalHEAD: "refs/heads/main",
+			ObjectFormat: "sha1", PreviousStorageRef: strings.Repeat("a", 40),
+			LogicalRefs: map[string]string{"refs/heads/main": strings.Repeat("1", 40)},
+		},
+		Packs: []cloakformat.PackPayload{{
+			Pack: []byte("PACK\x00binary pack payload"), ObjectIDs: []string{strings.Repeat("1", 40)},
+		}},
+	}
+	encoded, err := registry.EncodeSnapshot(testSecret, input)
+	if err != nil {
+		t.Fatalf("encode snapshot: %v", err)
+	}
+	identifier := regexp.MustCompile(`^[a-z2-7]{52}$`)
+	if len(encoded.Objects) != 3 {
+		t.Fatalf("encrypted object count = %d, want manifest, index, and chunk", len(encoded.Objects))
+	}
+	for locator := range encoded.Objects {
+		if !identifier.MatchString(locator) {
+			t.Fatalf("opaque identifier %q is not lowercase unpadded SHA-256 Base32", locator)
+		}
+	}
+	decoded, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, encoded.Objects)
+	if err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if len(decoded.Packs) != 1 || !bytes.Equal(decoded.Packs[0].Pack, input.Packs[0].Pack) {
+		t.Fatal("Pack Payload did not round-trip exactly")
+	}
+	if decoded.Repository.LogicalRefs["refs/heads/main"] != strings.Repeat("1", 40) {
+		t.Fatalf("Logical Ref did not round-trip: %+v", decoded.Repository.LogicalRefs)
+	}
+}
+
+func TestV1SnapshotRejectsMissingCorruptedAndSubstitutedEncryptedObjects(t *testing.T) {
+	registry := cloakformat.NewRegistry()
+	input := cloakformat.SnapshotInput{
+		Repository: cloakformat.Repository{
+			RepositoryID: testRepositoryID, Generation: 2, LogicalHEAD: "refs/heads/main",
+			ObjectFormat: "sha1", PreviousStorageRef: strings.Repeat("a", 40),
+			LogicalRefs: map[string]string{"refs/heads/main": strings.Repeat("1", 40)},
+		},
+		Packs: []cloakformat.PackPayload{{Pack: []byte("PACK-one"), ObjectIDs: []string{strings.Repeat("1", 40)}}},
+	}
+	encoded, err := registry.EncodeSnapshot(testSecret, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locators := make([]string, 0, len(encoded.Objects))
+	for locator := range encoded.Objects {
+		locators = append(locators, locator)
+	}
+
+	missing := cloneObjects(encoded.Objects)
+	delete(missing, locators[0])
+	if _, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, missing); err == nil {
+		t.Fatal("snapshot with missing encrypted object decoded successfully")
+	}
+
+	corrupted := cloneObjects(encoded.Objects)
+	corrupted[locators[0]][len(corrupted[locators[0]])-1] ^= 1
+	if _, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, corrupted); err == nil {
+		t.Fatal("snapshot with corrupted encrypted object decoded successfully")
+	}
+
+	substituted := cloneObjects(encoded.Objects)
+	substituted[locators[0]] = bytes.Clone(encoded.Objects[locators[1]])
+	if _, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, substituted); err == nil {
+		t.Fatal("snapshot with substituted encrypted object decoded successfully")
+	}
+}
+
+func TestV1PackPayloadSplitsAtFixedMaximumPlaintextChunkSize(t *testing.T) {
+	registry := cloakformat.NewRegistry()
+	pack := bytes.Repeat([]byte{0xa5}, cloakformat.DefaultChunkSize+1)
+	encoded, err := registry.EncodeSnapshot(testSecret, cloakformat.SnapshotInput{
+		Repository: cloakformat.Repository{
+			RepositoryID: testRepositoryID, Generation: 2, LogicalHEAD: "refs/heads/main",
+			ObjectFormat: "sha1", PreviousStorageRef: strings.Repeat("a", 40),
+			LogicalRefs: map[string]string{"refs/heads/main": strings.Repeat("1", 40)},
+		},
+		Packs: []cloakformat.PackPayload{{Pack: pack, ObjectIDs: []string{strings.Repeat("1", 40)}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded.Objects) != 4 {
+		t.Fatalf("encrypted object count = %d, want manifest, index, and two chunks", len(encoded.Objects))
+	}
+	decoded, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, encoded.Objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded.Packs[0].Pack, pack) {
+		t.Fatal("multi-chunk Pack Payload did not round-trip exactly")
+	}
+}
+
+func cloneObjects(objects map[string][]byte) map[string][]byte {
+	cloned := make(map[string][]byte, len(objects))
+	for locator, contents := range objects {
+		cloned[locator] = bytes.Clone(contents)
+	}
+	return cloned
 }
 
 func TestV1BootstrapUsesCanonicalPreamble(t *testing.T) {

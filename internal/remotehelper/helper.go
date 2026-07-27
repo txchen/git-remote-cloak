@@ -3,12 +3,13 @@ package remotehelper
 
 import (
 	"bufio"
-	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/txchen/git-remote-cloak/internal/domain"
@@ -18,7 +19,7 @@ import (
 // Run serves one non-interactive Git remote-helper session.
 func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Reader, output io.Writer) error {
 	repositoryEngine := engine.New()
-	repository, err := repositoryEngine.InspectEmpty(repositoryURL, recoverySecret)
+	repository, err := repositoryEngine.Inspect(repositoryURL, recoverySecret)
 	if err != nil {
 		return err
 	}
@@ -31,21 +32,29 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 	reader := bufio.NewScanner(input)
 	writer := bufio.NewWriter(output)
 	inFetchBatch := false
-	gitProtocol := ""
+	pushes := make([]directPush, 0, 1)
 	for reader.Scan() {
 		command := reader.Text()
 		switch {
 		case command == "capabilities":
-			if _, err := fmt.Fprint(writer, "option\nstateless-connect\n\n"); err != nil {
+			if _, err := fmt.Fprint(writer, "option\nfetch\npush\nobject-format\n\n"); err != nil {
 				return err
 			}
 		case command == "list" || command == "list for-push":
-			if _, err := fmt.Fprintf(writer, "@%s HEAD\n\n", repository.LogicalHEAD); err != nil {
+			if _, err := fmt.Fprintf(writer, ":object-format %s\n", repository.ObjectFormat); err != nil {
 				return err
 			}
-		case strings.HasPrefix(command, "option git-protocol "):
-			gitProtocol = strings.TrimPrefix(command, "option git-protocol ")
-			if _, err := fmt.Fprint(writer, "ok\n"); err != nil {
+			refNames := make([]string, 0, len(repository.LogicalRefs))
+			for name := range repository.LogicalRefs {
+				refNames = append(refNames, name)
+			}
+			sort.Strings(refNames)
+			for _, name := range refNames {
+				if _, err := fmt.Fprintf(writer, "%s %s\n", repository.LogicalRefs[name], name); err != nil {
+					return err
+				}
+			}
+			if _, err := fmt.Fprintf(writer, "@%s HEAD\n\n", repository.LogicalHEAD); err != nil {
 				return err
 			}
 		case strings.HasPrefix(command, "option "):
@@ -54,32 +63,55 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 			}
 		case command == "" && inFetchBatch:
 			inFetchBatch = false
+			if err := atomicallyRecoverGitClone(repositoryEngine, repositoryURL, recoverySecret); err != nil {
+				return err
+			}
+			gitDirectory, err := currentGitDirectory()
+			if err != nil {
+				return err
+			}
+			if err := repositoryEngine.FetchInto(repositoryURL, gitDirectory, recoverySecret); err != nil {
+				return err
+			}
 			if err := restoreLogicalHEAD(repository.LogicalHEAD); err != nil {
 				return err
 			}
 			if _, err := fmt.Fprint(writer, "\n"); err != nil {
 				return err
 			}
+		case command == "" && len(pushes) > 0:
+			if len(pushes) != 1 {
+				for _, push := range pushes {
+					fmt.Fprintf(writer, "error %s ticket #11 supports exactly one protected branch\n", push.destination)
+				}
+				_, _ = fmt.Fprint(writer, "\n")
+				return writer.Flush()
+			}
+			push := pushes[0]
+			gitDirectory, err := currentGitDirectory()
+			if err == nil {
+				err = repositoryEngine.PublishRef(repositoryURL, gitDirectory, push.source, push.destination, push.force, recoverySecret)
+			}
+			if err != nil {
+				if _, writeErr := fmt.Fprintf(writer, "error %s %s\n\n", push.destination, singleLine(err.Error())); writeErr != nil {
+					return writeErr
+				}
+				return writer.Flush()
+			}
+			if _, err := fmt.Fprintf(writer, "ok %s\n\n", push.destination); err != nil {
+				return err
+			}
+			return writer.Flush()
 		case command == "":
 			return nil
 		case strings.HasPrefix(command, "fetch "):
 			inFetchBatch = true
-		case command == "connect git-upload-pack":
-			if _, err := fmt.Fprint(writer, "\n"); err != nil {
+		case strings.HasPrefix(command, "push "):
+			push, err := parseDirectPush(strings.TrimPrefix(command, "push "))
+			if err != nil {
 				return err
 			}
-			if err := writer.Flush(); err != nil {
-				return err
-			}
-			return serveEmptyUploadPack(repository.LogicalHEAD, repository.ObjectFormat, gitProtocol, input, output)
-		case command == "stateless-connect git-upload-pack":
-			if _, err := fmt.Fprint(writer, "\n"); err != nil {
-				return err
-			}
-			if err := writer.Flush(); err != nil {
-				return err
-			}
-			return serveEmptyStatelessUploadPack(repository.LogicalHEAD, repository.ObjectFormat, input, output)
+			pushes = append(pushes, push)
 		default:
 			return fmt.Errorf("unsupported remote-helper command")
 		}
@@ -88,6 +120,46 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 		}
 	}
 	return reader.Err()
+}
+
+type directPush struct {
+	source      string
+	destination string
+	force       bool
+}
+
+func parseDirectPush(refspec string) (directPush, error) {
+	push := directPush{}
+	if strings.HasPrefix(refspec, "+") {
+		push.force = true
+		refspec = strings.TrimPrefix(refspec, "+")
+	}
+	var found bool
+	push.source, push.destination, found = strings.Cut(refspec, ":")
+	if !found || push.source == "" || push.destination == "" {
+		return directPush{}, errors.New("ticket #11 requires one branch-to-branch push")
+	}
+	return push, nil
+}
+
+func currentGitDirectory() (string, error) {
+	if configured, found := os.LookupEnv("GIT_DIR"); found {
+		absolute, err := filepath.Abs(configured)
+		if err != nil {
+			return "", err
+		}
+		return absolute, nil
+	}
+	command := exec.Command("git", "rev-parse", "--absolute-git-dir")
+	output, err := command.Output()
+	if err != nil {
+		return "", errors.New("remote helper could not locate the local Git object database")
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func singleLine(message string) string {
+	return strings.Join(strings.Fields(message), " ")
 }
 
 func atomicallyRecoverGitClone(repositoryEngine *engine.Engine, repositoryURL string, recoverySecret domain.RecoverySecret) error {
@@ -127,7 +199,7 @@ func atomicallyRecoverGitClone(repositoryEngine *engine.Engine, repositoryURL st
 			_ = os.Rename(scaffold, destination)
 		}
 	}()
-	if err := repositoryEngine.RecoverEmpty(repositoryURL, destination, recoverySecret); err != nil {
+	if err := repositoryEngine.RecoverForGitClone(repositoryURL, destination, recoverySecret); err != nil {
 		return err
 	}
 	restoreScaffold = false
@@ -135,111 +207,6 @@ func atomicallyRecoverGitClone(repositoryEngine *engine.Engine, repositoryURL st
 		return fmt.Errorf("remove replaced Git clone scaffold: %w", err)
 	}
 	return nil
-}
-
-func serveEmptyStatelessUploadPack(logicalHEAD domain.LogicalHEAD, objectFormat string, input io.Reader, output io.Writer) error {
-	temporary, err := makeEmptyBareRepository(logicalHEAD, objectFormat)
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(temporary)
-	advertise := exec.Command("git", "upload-pack", "--advertise-refs", temporary)
-	advertise.Env = append(os.Environ(), "GIT_PROTOCOL=version=2")
-	advertisement, err := advertise.Output()
-	if err != nil {
-		return fmt.Errorf("advertise empty Recovered Repository: %w", err)
-	}
-	if _, err := output.Write(advertisement); err != nil {
-		return err
-	}
-	for {
-		request, err := readPacketMessage(input)
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		uploadPack := exec.Command("git", "upload-pack", "--stateless-rpc", temporary)
-		uploadPack.Env = append(os.Environ(), "GIT_PROTOCOL=version=2")
-		uploadPack.Stdin = bytes.NewReader(request)
-		response, err := uploadPack.Output()
-		if err != nil {
-			return fmt.Errorf("serve empty Recovered Repository request: %w", err)
-		}
-		if _, err := output.Write(response); err != nil {
-			return err
-		}
-		if _, err := io.WriteString(output, "0002"); err != nil {
-			return err
-		}
-	}
-}
-
-func readPacketMessage(input io.Reader) ([]byte, error) {
-	var message bytes.Buffer
-	header := make([]byte, 4)
-	for {
-		if _, err := io.ReadFull(input, header); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return nil, io.EOF
-			}
-			return nil, err
-		}
-		message.Write(header)
-		if string(header) == "0000" {
-			return message.Bytes(), nil
-		}
-		if string(header) == "0001" || string(header) == "0002" {
-			continue
-		}
-		var packetLength int
-		if _, err := fmt.Sscanf(string(header), "%04x", &packetLength); err != nil || packetLength < 4 || packetLength > 65520 {
-			return nil, fmt.Errorf("invalid packet line from Git")
-		}
-		payload := make([]byte, packetLength-4)
-		if _, err := io.ReadFull(input, payload); err != nil {
-			return nil, err
-		}
-		message.Write(payload)
-	}
-}
-
-func serveEmptyUploadPack(logicalHEAD domain.LogicalHEAD, objectFormat, gitProtocol string, input io.Reader, output io.Writer) error {
-	temporary, err := makeEmptyBareRepository(logicalHEAD, objectFormat)
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(temporary)
-	uploadPack := exec.Command("git", "upload-pack", temporary)
-	if gitProtocol != "" {
-		uploadPack.Env = append(os.Environ(), "GIT_PROTOCOL="+gitProtocol)
-	}
-	uploadPack.Stdin = input
-	uploadPack.Stdout = output
-	uploadPack.Stderr = os.Stderr
-	if err := uploadPack.Run(); err != nil {
-		return fmt.Errorf("serve temporary Recovered Repository: %w", err)
-	}
-	return nil
-}
-
-func makeEmptyBareRepository(logicalHEAD domain.LogicalHEAD, objectFormat string) (string, error) {
-	temporary, err := os.MkdirTemp("", "git-remote-cloak-upload-pack-")
-	if err != nil {
-		return "", fmt.Errorf("create temporary Recovered Repository: %w", err)
-	}
-	if err := os.Chmod(temporary, 0o700); err != nil {
-		os.RemoveAll(temporary)
-		return "", err
-	}
-	branch := strings.TrimPrefix(string(logicalHEAD), "refs/heads/")
-	initialize := exec.Command("git", "init", "--bare", "--object-format="+objectFormat, "-b", branch, temporary)
-	if result, err := initialize.CombinedOutput(); err != nil {
-		os.RemoveAll(temporary)
-		return "", fmt.Errorf("initialize temporary Recovered Repository: %s", strings.TrimSpace(string(result)))
-	}
-	return temporary, nil
 }
 
 func restoreMissingLogicalHEAD(logicalHEAD domain.LogicalHEAD) error {

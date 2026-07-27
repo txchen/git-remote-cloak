@@ -13,6 +13,7 @@ import (
 
 	"github.com/txchen/git-remote-cloak/internal/domain"
 	cloakformat "github.com/txchen/git-remote-cloak/internal/format"
+	"github.com/txchen/git-remote-cloak/internal/gitdb"
 	"github.com/txchen/git-remote-cloak/internal/localstate"
 	"github.com/txchen/git-remote-cloak/internal/storage"
 )
@@ -93,9 +94,13 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 		if err != nil {
 			return err
 		}
-		repository, err = engine.formats.DecodeEmpty(secret, snapshot.Bootstrap, snapshot.Manifest)
+		decoded, err := engine.decodeSnapshot(secret, snapshot)
 		if err != nil {
 			return errors.New("existing Ciphertext Repository has another Cloak identity")
+		}
+		repository = cloakformat.EmptyRepository{
+			RepositoryID: decoded.Repository.RepositoryID, LogicalHEAD: decoded.Repository.LogicalHEAD,
+			ObjectFormat: decoded.Repository.ObjectFormat,
 		}
 		if repository.LogicalHEAD != domain.LogicalHEAD(logicalHEADName) {
 			return errors.New("existing Ciphertext Repository Logical HEAD does not match")
@@ -119,31 +124,19 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 
 // RecoverEmpty atomically creates an ordinary empty Recovered Repository.
 func (engine *Engine) RecoverEmpty(repositoryURL, destination string, secret domain.RecoverySecret) error {
-	transport, err := storage.OpenLocalBare(repositoryURL)
+	decoded, err := engine.readSnapshot(repositoryURL, secret)
 	if err != nil {
 		return err
 	}
-	refs, err := transport.Refs()
-	if err != nil {
-		return err
-	}
-	if len(refs) != 1 || refs[0] != storage.StorageRef {
-		return errors.New("Repository Host does not expose exactly one Storage Ref")
-	}
-	snapshot, err := transport.Read()
-	if err != nil {
-		return err
-	}
-	repository, err := engine.formats.DecodeEmpty(secret, snapshot.Bootstrap, snapshot.Manifest)
-	if err != nil {
-		return err
+	if len(decoded.Repository.LogicalRefs) > 0 {
+		return engine.recoverDecoded(repositoryURL, destination, decoded)
 	}
 	if destination == "" {
 		destination = defaultDestination(repositoryURL)
 	}
 	return localstate.PublishDirectory(destination, func(temporary string) error {
-		branch := strings.TrimPrefix(string(repository.LogicalHEAD), "refs/heads/")
-		if _, err := git(filepath.Dir(temporary), nil, "init", "--object-format="+repository.ObjectFormat, "-b", branch, temporary); err != nil {
+		branch := strings.TrimPrefix(string(decoded.Repository.LogicalHEAD), "refs/heads/")
+		if _, err := git(filepath.Dir(temporary), nil, "init", "--object-format="+decoded.Repository.ObjectFormat, "-b", branch, temporary); err != nil {
 			return fmt.Errorf("initialize Recovered Repository: %w", err)
 		}
 		if _, err := git(temporary, nil, "remote", "add", "origin", "cloak::"+repositoryURL); err != nil {
@@ -154,6 +147,143 @@ func (engine *Engine) RecoverEmpty(repositoryURL, destination string, secret dom
 		}
 		return nil
 	})
+}
+
+// Recover atomically creates and validates a complete Recovered Repository.
+func (engine *Engine) Recover(repositoryURL, destination string, secret domain.RecoverySecret) error {
+	return engine.RecoverEmpty(repositoryURL, destination, secret)
+}
+
+// RecoverForGitClone atomically prepares refs and objects while leaving worktree checkout to Git.
+func (engine *Engine) RecoverForGitClone(repositoryURL, destination string, secret domain.RecoverySecret) error {
+	decoded, err := engine.readSnapshot(repositoryURL, secret)
+	if err != nil {
+		return err
+	}
+	if len(decoded.Repository.LogicalRefs) == 0 {
+		return engine.RecoverEmpty(repositoryURL, destination, secret)
+	}
+	if destination == "" {
+		destination = defaultDestination(repositoryURL)
+	}
+	return localstate.PublishDirectory(destination, func(temporary string) error {
+		state := gitdb.State{LogicalHEAD: decoded.Repository.LogicalHEAD, ObjectFormat: decoded.Repository.ObjectFormat, LogicalRefs: decoded.Repository.LogicalRefs}
+		if err := gitdb.RestoreForClone(temporary, state, decoded.Packs); err != nil {
+			return err
+		}
+		if _, err := git(temporary, nil, "remote", "add", "origin", "cloak::"+repositoryURL); err != nil {
+			return fmt.Errorf("configure recovered origin: %w", err)
+		}
+		return nil
+	})
+}
+
+// RecoverBare restores a validated temporary bare Logical Repository for Git protocol service.
+func (engine *Engine) RecoverBare(repositoryURL, destination string, secret domain.RecoverySecret) error {
+	decoded, err := engine.readSnapshot(repositoryURL, secret)
+	if err != nil {
+		return err
+	}
+	if len(decoded.Repository.LogicalRefs) == 0 {
+		_, err := makeEmptyBare(destination, decoded.Repository)
+		return err
+	}
+	return gitdb.Restore(destination, true, gitdb.State{
+		LogicalHEAD: decoded.Repository.LogicalHEAD, ObjectFormat: decoded.Repository.ObjectFormat,
+		LogicalRefs: decoded.Repository.LogicalRefs,
+	}, decoded.Packs)
+}
+
+// Publish reads one protected branch from a bare Logical Repository and atomically publishes it.
+func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret domain.RecoverySecret) error {
+	transport, err := storage.OpenLocalBare(repositoryURL)
+	if err != nil {
+		return err
+	}
+	snapshot, err := transport.Read()
+	if err != nil {
+		return err
+	}
+	current, err := engine.decodeSnapshot(secret, snapshot)
+	if err != nil {
+		return err
+	}
+	if len(current.Repository.LogicalRefs) != 0 {
+		return errors.New("ticket #11 supports only the ordinary first push")
+	}
+	state, err := gitdb.ReadState(logicalGitDirectory)
+	if err != nil {
+		return err
+	}
+	if state.LogicalHEAD != current.Repository.LogicalHEAD || state.ObjectFormat != current.Repository.ObjectFormat {
+		return errors.New("pushed Logical Repository identity does not match initialized Ciphertext Repository")
+	}
+	payload, err := gitdb.CreatePack(logicalGitDirectory)
+	if err != nil {
+		return err
+	}
+	repository := cloakformat.Repository{
+		RepositoryID: current.Repository.RepositoryID, Generation: current.Repository.Generation + 1,
+		LogicalHEAD: state.LogicalHEAD, ObjectFormat: state.ObjectFormat, LogicalRefs: state.LogicalRefs,
+		PreviousStorageRef: snapshot.StorageID,
+	}
+	encoded, err := engine.formats.EncodeSnapshot(secret, cloakformat.SnapshotInput{
+		Repository: repository, Packs: []cloakformat.PackPayload{payload},
+	})
+	if err != nil {
+		return err
+	}
+	// Validate the exact candidate logical state before uploading any ciphertext.
+	candidate, err := engine.formats.DecodeSnapshot(secret, encoded.Bootstrap, encoded.Objects)
+	if err != nil {
+		return fmt.Errorf("validate candidate Ciphertext Snapshot: %w", err)
+	}
+	temporaryRoot, err := os.MkdirTemp("", "git-remote-cloak-candidate-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(temporaryRoot)
+	temporary := filepath.Join(temporaryRoot, "repository.git")
+	if err := gitdb.Restore(temporary, true, state, candidate.Packs); err != nil {
+		return fmt.Errorf("validate candidate Logical Repository: %w", err)
+	}
+	_, err = transport.PublishSnapshot(snapshot.StorageID, encoded.Bootstrap, encoded.Objects)
+	return err
+}
+
+// FetchInto imports authenticated native packs into an existing Git object database.
+func (engine *Engine) FetchInto(repositoryURL, gitDirectory string, secret domain.RecoverySecret) error {
+	decoded, err := engine.readSnapshot(repositoryURL, secret)
+	if err != nil {
+		return err
+	}
+	return gitdb.Import(gitDirectory, decoded.Packs)
+}
+
+// PublishRef applies the ticket #11 direct remote-helper push to one protected branch.
+func (engine *Engine) PublishRef(repositoryURL, sourceGitDirectory, sourceRef, destinationRef string, force bool, secret domain.RecoverySecret) error {
+	if !strings.HasPrefix(sourceRef, "refs/") || !strings.HasPrefix(destinationRef, "refs/heads/") {
+		return errors.New("ticket #11 requires one branch-to-branch push")
+	}
+	temporaryRoot, err := os.MkdirTemp("", "git-remote-cloak-receive-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(temporaryRoot)
+	temporary := filepath.Join(temporaryRoot, "repository.git")
+	if err := engine.RecoverBare(repositoryURL, temporary, secret); err != nil {
+		return err
+	}
+	refspec := sourceRef + ":" + destinationRef
+	if force {
+		refspec = "+" + refspec
+	}
+	command := exec.Command("git", "--git-dir="+temporary, "fetch", "--no-tags", sourceGitDirectory, refspec)
+	command.Env = append(cleanGitEnvironment(os.Environ()), "GIT_CONFIG_NOSYSTEM=1")
+	if output, err := command.CombinedOutput(); err != nil {
+		return fmt.Errorf("receive pushed Logical Ref: %s", strings.TrimSpace(string(output)))
+	}
+	return engine.Publish(repositoryURL, temporary, secret)
 }
 
 // InspectEmpty authenticates and returns the logical state for a remote-helper adapter.
@@ -167,6 +297,69 @@ func (engine *Engine) InspectEmpty(repositoryURL string, secret domain.RecoveryS
 		return cloakformat.EmptyRepository{}, err
 	}
 	return engine.formats.DecodeEmpty(secret, snapshot.Bootstrap, snapshot.Manifest)
+}
+
+// Inspect authenticates and returns the current logical state.
+func (engine *Engine) Inspect(repositoryURL string, secret domain.RecoverySecret) (cloakformat.Repository, error) {
+	decoded, err := engine.readSnapshot(repositoryURL, secret)
+	return decoded.Repository, err
+}
+
+func (engine *Engine) readSnapshot(repositoryURL string, secret domain.RecoverySecret) (cloakformat.DecodedSnapshot, error) {
+	transport, err := storage.OpenLocalBare(repositoryURL)
+	if err != nil {
+		return cloakformat.DecodedSnapshot{}, err
+	}
+	refs, err := transport.Refs()
+	if err != nil {
+		return cloakformat.DecodedSnapshot{}, err
+	}
+	if len(refs) != 1 || refs[0] != storage.StorageRef {
+		return cloakformat.DecodedSnapshot{}, errors.New("Repository Host does not expose exactly one Storage Ref")
+	}
+	snapshot, err := transport.Read()
+	if err != nil {
+		return cloakformat.DecodedSnapshot{}, err
+	}
+	return engine.decodeSnapshot(secret, snapshot)
+}
+
+func (engine *Engine) decodeSnapshot(secret domain.RecoverySecret, snapshot storage.Snapshot) (cloakformat.DecodedSnapshot, error) {
+	if snapshot.Manifest != nil {
+		empty, err := engine.formats.DecodeEmpty(secret, snapshot.Bootstrap, snapshot.Manifest)
+		if err == nil {
+			return cloakformat.DecodedSnapshot{Repository: cloakformat.Repository{
+				RepositoryID: empty.RepositoryID, Generation: 1, LogicalHEAD: empty.LogicalHEAD,
+				ObjectFormat: empty.ObjectFormat, LogicalRefs: map[string]string{},
+			}}, nil
+		}
+	}
+	return engine.formats.DecodeSnapshot(secret, snapshot.Bootstrap, snapshot.Objects)
+}
+
+func (engine *Engine) recoverDecoded(repositoryURL, destination string, decoded cloakformat.DecodedSnapshot) error {
+	if destination == "" {
+		destination = defaultDestination(repositoryURL)
+	}
+	return localstate.PublishDirectory(destination, func(temporary string) error {
+		state := gitdb.State{LogicalHEAD: decoded.Repository.LogicalHEAD, ObjectFormat: decoded.Repository.ObjectFormat, LogicalRefs: decoded.Repository.LogicalRefs}
+		if err := gitdb.Restore(temporary, false, state, decoded.Packs); err != nil {
+			return err
+		}
+		if _, err := git(temporary, nil, "remote", "add", "origin", "cloak::"+repositoryURL); err != nil {
+			return fmt.Errorf("configure recovered origin: %w", err)
+		}
+		return nil
+	})
+}
+
+func makeEmptyBare(destination string, repository cloakformat.Repository) (string, error) {
+	branch := strings.TrimPrefix(string(repository.LogicalHEAD), "refs/heads/")
+	command := exec.Command("git", "init", "--bare", "--object-format="+repository.ObjectFormat, "-b", branch, destination)
+	if output, err := command.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("initialize empty Logical Repository: %s", strings.TrimSpace(string(output)))
+	}
+	return destination, nil
 }
 
 func defaultDestination(repositoryURL string) string {

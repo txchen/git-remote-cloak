@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -18,6 +19,8 @@ const StorageRef = "refs/heads/cloak-storage"
 type Snapshot struct {
 	Bootstrap []byte
 	Manifest  []byte
+	Objects   map[string][]byte
+	StorageID string
 }
 
 // LocalBare is a deterministic adapter for a local bare Repository Host.
@@ -69,8 +72,27 @@ func (transport *LocalBare) Refs() ([]string, error) {
 	return strings.Fields(string(output)), nil
 }
 
-// Read obtains the current complete empty Ciphertext Snapshot.
+// Current returns the current Storage Ref object ID or the all-zero object ID.
+func (transport *LocalBare) Current() (string, error) {
+	output, err := runGit(transport.path, nil, "for-each-ref", "--format=%(objectname)", StorageRef)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(string(output)) == "" {
+		return transport.zeroObject, nil
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// Read obtains the current complete Ciphertext Snapshot.
 func (transport *LocalBare) Read() (Snapshot, error) {
+	storageID, err := transport.Current()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if storageID == transport.zeroObject {
+		return Snapshot{}, errors.New("Storage Ref does not exist")
+	}
 	bootstrap, err := runGit(transport.path, nil, "show", StorageRef+":bootstrap")
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("read Bootstrap Header: %w", err)
@@ -80,43 +102,82 @@ func (transport *LocalBare) Read() (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("list encrypted manifest: %w", err)
 	}
 	objectPaths := strings.Fields(string(paths))
-	if len(objectPaths) != 1 || !strings.HasPrefix(objectPaths[0], "objects/") {
-		return Snapshot{}, errors.New("Ciphertext Snapshot does not contain exactly one Encrypted Manifest")
+	if len(objectPaths) == 0 {
+		return Snapshot{}, errors.New("Ciphertext Snapshot contains no encrypted objects")
 	}
-	manifest, err := runGit(transport.path, nil, "show", StorageRef+":"+objectPaths[0])
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("read Encrypted Manifest: %w", err)
+	objects := make(map[string][]byte, len(objectPaths))
+	for _, objectPath := range objectPaths {
+		if !strings.HasPrefix(objectPath, "objects/") || strings.Count(objectPath, "/") != 1 {
+			return Snapshot{}, errors.New("Ciphertext Snapshot contains an invalid encrypted object path")
+		}
+		contents, err := runGit(transport.path, nil, "show", StorageRef+":"+objectPath)
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("read encrypted object: %w", err)
+		}
+		objects[strings.TrimPrefix(objectPath, "objects/")] = contents
 	}
-	return Snapshot{Bootstrap: bootstrap, Manifest: manifest}, nil
+	snapshot := Snapshot{Bootstrap: bootstrap, Objects: objects, StorageID: storageID}
+	if len(objects) == 1 {
+		for _, contents := range objects {
+			snapshot.Manifest = contents
+		}
+	}
+	return snapshot, nil
 }
 
 // PublishEmpty uploads immutable objects and compare-and-swap creates the Storage Ref.
 func (transport *LocalBare) PublishEmpty(bootstrap, manifest []byte, locator string) error {
+	_, err := transport.PublishSnapshot(transport.zeroObject, bootstrap, map[string][]byte{locator: manifest})
+	return err
+}
+
+// PublishSnapshot uploads immutable ciphertext before compare-and-swap publishing one Storage commit.
+func (transport *LocalBare) PublishSnapshot(expectedStorageID string, bootstrap []byte, objects map[string][]byte) (string, error) {
+	if len(objects) == 0 {
+		return "", errors.New("Ciphertext Snapshot contains no encrypted objects")
+	}
 	bootstrapOID, err := transport.writeBlob(bootstrap)
 	if err != nil {
-		return err
+		return "", err
 	}
-	manifestOID, err := transport.writeBlob(manifest)
-	if err != nil {
-		return err
+	locators := make([]string, 0, len(objects))
+	for locator := range objects {
+		locators = append(locators, locator)
 	}
-	objectsTree, err := runGit(transport.path, []byte(fmt.Sprintf("100644 blob %s\t%s\n", manifestOID, locator)), "mktree")
+	sort.Strings(locators)
+	var objectTreeInput strings.Builder
+	for _, locator := range locators {
+		if locator == "" || strings.Contains(locator, "/") {
+			return "", errors.New("invalid opaque ciphertext object locator")
+		}
+		objectID, err := transport.writeBlob(objects[locator])
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&objectTreeInput, "100644 blob %s\t%s\n", objectID, locator)
+	}
+	objectsTree, err := runGit(transport.path, []byte(objectTreeInput.String()), "mktree")
 	if err != nil {
-		return fmt.Errorf("build ciphertext objects tree: %w", err)
+		return "", fmt.Errorf("build ciphertext objects tree: %w", err)
 	}
 	rootInput := fmt.Sprintf("100644 blob %s\tbootstrap\n040000 tree %s\tobjects\n", bootstrapOID, strings.TrimSpace(string(objectsTree)))
 	rootTree, err := runGit(transport.path, []byte(rootInput), "mktree")
 	if err != nil {
-		return fmt.Errorf("build Ciphertext Snapshot tree: %w", err)
+		return "", fmt.Errorf("build Ciphertext Snapshot tree: %w", err)
 	}
-	commit, err := runGit(transport.path, []byte("cloak snapshot\n"), "commit-tree", strings.TrimSpace(string(rootTree)))
+	commitArguments := []string{"commit-tree", strings.TrimSpace(string(rootTree))}
+	if expectedStorageID != transport.zeroObject {
+		commitArguments = append(commitArguments, "-p", expectedStorageID)
+	}
+	commit, err := runGit(transport.path, []byte("cloak snapshot\n"), commitArguments...)
 	if err != nil {
-		return fmt.Errorf("build Storage commit: %w", err)
+		return "", fmt.Errorf("build Storage commit: %w", err)
 	}
-	if _, err := runGit(transport.path, nil, "update-ref", StorageRef, strings.TrimSpace(string(commit)), transport.zeroObject); err != nil {
-		return fmt.Errorf("publish Storage Ref: %w", err)
+	commitID := strings.TrimSpace(string(commit))
+	if _, err := runGit(transport.path, nil, "update-ref", StorageRef, commitID, expectedStorageID); err != nil {
+		return "", fmt.Errorf("compare-and-swap publish Storage Ref: %w", err)
 	}
-	return nil
+	return commitID, nil
 }
 
 func (transport *LocalBare) writeBlob(contents []byte) (string, error) {

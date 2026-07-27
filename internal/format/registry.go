@@ -61,6 +61,7 @@ type EncodedSnapshot struct {
 	Bootstrap       []byte
 	Manifest        []byte
 	ManifestLocator string
+	Objects         map[string][]byte
 }
 
 // Capability reports one exact Ciphertext Repository reader and writer.
