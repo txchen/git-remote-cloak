@@ -7,7 +7,9 @@ record-context = {
   4: 1,                    ; AES-256-GCM-SIV RAW suite
   5: bytes .size 16,       ; Repository ID
   6: "encrypted-manifest" / "encrypted-pack-index" / "encrypted-pack-chunk",
-  7: uint,                 ; storage generation
+  7: uint,                 ; storage generation for manifests; 0 for reusable Pack Payload records
   8: bool,                 ; authenticated final-record marker
-  9: uint                  ; plaintext length
+  9: uint,                 ; plaintext length
+  ? 10: bytes .size 16,   ; Pack Payload identity
+  ? 11: uint              ; chunk index
 }

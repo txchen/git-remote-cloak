@@ -21,7 +21,7 @@ type State struct {
 	LogicalRefs  map[string]string
 }
 
-// ReadState reads the one-branch vertical slice from a bare Logical Repository.
+// ReadState reads the branches and tags from a bare Logical Repository.
 func ReadState(gitDirectory string) (State, error) {
 	head, err := run(gitDirectory, nil, "symbolic-ref", "HEAD")
 	if err != nil {
@@ -41,28 +41,39 @@ func ReadState(gitDirectory string) (State, error) {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) != 2 || !strings.HasPrefix(fields[0], "refs/heads/") {
-			return State{}, errors.New("ticket #11 supports exactly one protected branch")
+		if len(fields) != 2 || !domain.LogicalRefName(fields[0]).IsSupported() {
+			return State{}, errors.New("Logical Repository contains an unsupported ref")
 		}
 		refs[fields[0]] = fields[1]
-	}
-	if len(refs) != 1 {
-		return State{}, errors.New("ticket #11 requires exactly one protected branch")
 	}
 	return State{LogicalHEAD: domain.LogicalHEAD(strings.TrimSpace(string(head))), ObjectFormat: strings.TrimSpace(string(objectFormat)), LogicalRefs: refs}, nil
 }
 
 // CreatePack creates one self-contained native pack and its exact reachable object index.
 func CreatePack(gitDirectory string) (cloakformat.PackPayload, error) {
-	pack, err := run(gitDirectory, nil, "pack-objects", "--stdout", "--all")
-	if err != nil {
-		return cloakformat.PackPayload{}, fmt.Errorf("create self-contained native Git Pack Payload: %w", err)
-	}
-	objectIDs, err := reachableObjectIDs(gitDirectory)
+	objectIDs, err := ReachableObjectIDs(gitDirectory)
 	if err != nil {
 		return cloakformat.PackPayload{}, err
 	}
+	return CreatePackForObjects(gitDirectory, objectIDs)
+}
+
+// CreatePackForObjects creates a self-contained native pack for exactly the selected objects.
+func CreatePackForObjects(gitDirectory string, objectIDs []string) (cloakformat.PackPayload, error) {
+	if len(objectIDs) == 0 {
+		return cloakformat.PackPayload{}, errors.New("cannot create an empty Pack Payload")
+	}
+	input := []byte(strings.Join(objectIDs, "\n") + "\n")
+	pack, err := run(gitDirectory, input, "pack-objects", "--stdout", "--no-reuse-delta", "--no-reuse-object")
+	if err != nil {
+		return cloakformat.PackPayload{}, fmt.Errorf("create self-contained native Git Pack Payload: %w", err)
+	}
 	return cloakformat.PackPayload{Pack: pack, ObjectIDs: objectIDs}, nil
+}
+
+// ReachableObjectIDs returns the exact sorted object IDs reachable from supported Logical Refs.
+func ReachableObjectIDs(gitDirectory string) ([]string, error) {
+	return reachableObjectIDs(gitDirectory)
 }
 
 // Import adds authenticated Pack Payloads to an existing local Git object database.
@@ -97,21 +108,19 @@ func Restore(destination string, bare bool, state State, packs []cloakformat.Pac
 
 // RestoreForClone prepares a non-bare object database and refs while leaving checkout to Git clone.
 func RestoreForClone(destination string, state State, packs []cloakformat.PackPayload) error {
-	return restore(destination, false, false, state, packs)
+	gitDirectory, err := initializeAndImport(destination, false, state, packs)
+	if err != nil {
+		return err
+	}
+	if _, err := run(gitDirectory, nil, "fsck", "--full"); err != nil {
+		return fmt.Errorf("validate Recovered Repository objects: %w", err)
+	}
+	return nil
 }
 
 func restore(destination string, bare, checkout bool, state State, packs []cloakformat.PackPayload) error {
-	arguments := []string{"init", "--object-format=" + state.ObjectFormat}
-	if bare {
-		arguments = append(arguments, "--bare")
-	}
-	arguments = append(arguments, "-b", strings.TrimPrefix(string(state.LogicalHEAD), "refs/heads/"), destination)
-	initialize := exec.Command("git", arguments...)
-	initialize.Env = cleanEnvironment()
-	if output, err := initialize.CombinedOutput(); err != nil {
-		return fmt.Errorf("initialize Recovered Repository: %s", strings.TrimSpace(string(output)))
-	}
-	if err := Import(destinationGitDirectory(destination, bare), packs); err != nil {
+	gitDirectory, err := initializeAndImport(destination, bare, state, packs)
+	if err != nil {
 		return err
 	}
 	refNames := make([]string, 0, len(state.LogicalRefs))
@@ -120,36 +129,62 @@ func restore(destination string, bare, checkout bool, state State, packs []cloak
 	}
 	sort.Strings(refNames)
 	for _, name := range refNames {
-		if _, err := run(destinationGitDirectory(destination, bare), nil, "update-ref", name, state.LogicalRefs[name]); err != nil {
+		if _, err := run(gitDirectory, nil, "update-ref", name, state.LogicalRefs[name]); err != nil {
 			return fmt.Errorf("restore Logical Ref %s: %w", name, err)
 		}
 	}
-	if _, err := run(destinationGitDirectory(destination, bare), nil, "symbolic-ref", "HEAD", string(state.LogicalHEAD)); err != nil {
-		return fmt.Errorf("restore Logical HEAD: %w", err)
-	}
 	for name, want := range state.LogicalRefs {
-		got, err := run(destinationGitDirectory(destination, bare), nil, "rev-parse", "--verify", name)
+		got, err := run(gitDirectory, nil, "rev-parse", "--verify", name)
 		if err != nil || strings.TrimSpace(string(got)) != want {
 			return fmt.Errorf("restored Logical Ref %s does not match Encrypted Manifest", name)
 		}
 	}
 	wantObjects := indexedObjectIDs(packs)
-	gotObjects, err := reachableObjectIDs(destinationGitDirectory(destination, bare))
+	gotObjects, err := reachableObjectIDs(gitDirectory)
 	if err != nil {
 		return err
 	}
-	if strings.Join(gotObjects, "\n") != strings.Join(wantObjects, "\n") {
-		return errors.New("Recovered Repository reachable object set disagrees with Encrypted Pack Index")
+	indexed := make(map[string]struct{}, len(wantObjects))
+	for _, objectID := range wantObjects {
+		indexed[objectID] = struct{}{}
 	}
-	if _, err := run(destinationGitDirectory(destination, bare), nil, "fsck", "--full"); err != nil {
+	for _, objectID := range gotObjects {
+		if _, exists := indexed[objectID]; !exists {
+			return errors.New("Recovered Repository reachable object set disagrees with Encrypted Pack Index")
+		}
+	}
+	if _, err := run(gitDirectory, nil, "fsck", "--full"); err != nil {
 		return fmt.Errorf("validate Recovered Repository: %w", err)
 	}
 	if checkout {
-		if _, err := runWorkTree(destination, "reset", "--hard", state.LogicalRefs[string(state.LogicalHEAD)]); err != nil {
-			return fmt.Errorf("check out Recovered Repository: %w", err)
+		if target, exists := state.LogicalRefs[string(state.LogicalHEAD)]; exists {
+			if _, err := runWorkTree(destination, "reset", "--hard", target); err != nil {
+				return fmt.Errorf("check out Recovered Repository: %w", err)
+			}
 		}
 	}
 	return nil
+}
+
+func initializeAndImport(destination string, bare bool, state State, packs []cloakformat.PackPayload) (string, error) {
+	arguments := []string{"init", "--object-format=" + state.ObjectFormat}
+	if bare {
+		arguments = append(arguments, "--bare")
+	}
+	arguments = append(arguments, "-b", strings.TrimPrefix(string(state.LogicalHEAD), "refs/heads/"), destination)
+	initialize := exec.Command("git", arguments...)
+	initialize.Env = cleanEnvironment()
+	if output, err := initialize.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("initialize Recovered Repository: %s", strings.TrimSpace(string(output)))
+	}
+	gitDirectory := destinationGitDirectory(destination, bare)
+	if err := Import(gitDirectory, packs); err != nil {
+		return "", err
+	}
+	if _, err := run(gitDirectory, nil, "symbolic-ref", "HEAD", string(state.LogicalHEAD)); err != nil {
+		return "", fmt.Errorf("restore Logical HEAD: %w", err)
+	}
+	return gitDirectory, nil
 }
 
 func runWorkTree(workTree string, arguments ...string) ([]byte, error) {

@@ -33,6 +33,8 @@ func run(arguments []string) error {
 		return runInit(arguments[1:])
 	case "clone":
 		return runClone(arguments[1:])
+	case "set-head":
+		return runSetHead(arguments[1:])
 	default:
 		if len(arguments) == 2 {
 			recoverySecret, err := acquireSecret("", false)
@@ -43,6 +45,25 @@ func run(arguments []string) error {
 		}
 		return usageError()
 	}
+}
+
+func runSetHead(arguments []string) error {
+	if len(arguments) != 2 {
+		return fmt.Errorf("usage: git-remote-cloak set-head <remote-name> <branch>")
+	}
+	recoverySecret, err := acquireSecret("", false)
+	if err != nil {
+		return err
+	}
+	workspace, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	if err := engine.New().SetHead(workspace, arguments[0], arguments[1], recoverySecret); err != nil {
+		return err
+	}
+	fmt.Printf("Logical HEAD now selects refs/heads/%s.\n", strings.TrimPrefix(arguments[1], "refs/heads/"))
+	return nil
 }
 
 func runVersion(arguments []string) error {
@@ -173,5 +194,5 @@ func acquireSecret(explicitFile string, allowGeneration bool) (domain.RecoverySe
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: git-remote-cloak <init|clone|version>")
+	return fmt.Errorf("usage: git-remote-cloak <init|clone|set-head|version>")
 }

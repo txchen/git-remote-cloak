@@ -120,6 +120,51 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 	return nil
 }
 
+// SetHead atomically changes the encrypted Logical HEAD.
+func (engine *Engine) SetHead(workspace, remoteName, branch string, secret domain.RecoverySecret) error {
+	if remoteName == "" || branch == "" {
+		return errors.New("remote name and Logical HEAD branch are required")
+	}
+	logicalHEAD := "refs/heads/" + strings.TrimPrefix(branch, "refs/heads/")
+	if _, err := git(workspace, nil, "check-ref-format", "--branch", strings.TrimPrefix(logicalHEAD, "refs/heads/")); err != nil {
+		return errors.New("Logical HEAD is not a valid Git branch name")
+	}
+	configuredURL, err := git(workspace, nil, "remote", "get-url", remoteName)
+	if err != nil {
+		return fmt.Errorf("read Cloak remote %s: %w", remoteName, err)
+	}
+	repositoryURL, found := strings.CutPrefix(strings.TrimSpace(string(configuredURL)), "cloak::")
+	if !found || repositoryURL == "" {
+		return errors.New("configured remote is not a Cloak remote")
+	}
+	transport, err := storage.OpenGit(repositoryURL)
+	if err != nil {
+		return err
+	}
+	defer transport.Close()
+	current, storageCommitID, err := engine.decodeTransportSnapshot(secret, transport)
+	if err != nil {
+		return err
+	}
+	repository := current.Repository
+	repository.Generation++
+	repository.PreviousStorageRef = storageCommitID
+	repository.LogicalHEAD = domain.LogicalHEAD(logicalHEAD)
+	encoded, err := engine.formats.EncodeSnapshot(secret, cloakformat.SnapshotInput{Repository: repository, Packs: current.Packs})
+	if err != nil {
+		return err
+	}
+	candidate, err := engine.formats.DecodeSnapshot(secret, encoded.Bootstrap, encoded.CiphertextObjects)
+	if err != nil {
+		return fmt.Errorf("validate Logical HEAD snapshot: %w", err)
+	}
+	if candidate.Repository.LogicalHEAD != repository.LogicalHEAD || !maps.Equal(candidate.Repository.LogicalRefs, repository.LogicalRefs) {
+		return errors.New("candidate Ciphertext Snapshot does not preserve the intended Logical HEAD state")
+	}
+	_, err = transport.PublishSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
+	return err
+}
+
 // Recover atomically creates and validates a complete Recovered Repository.
 func (engine *Engine) Recover(repositoryURL, destination string, secret domain.RecoverySecret) error {
 	decoded, err := engine.readSnapshot(repositoryURL, secret)
@@ -192,7 +237,7 @@ func (engine *Engine) RecoverBare(repositoryURL, destination string, secret doma
 	}, decoded.Packs)
 }
 
-// Publish reads one protected branch from a bare Logical Repository and atomically publishes it.
+// Publish reads the complete Logical Repository state and atomically publishes it.
 func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret domain.RecoverySecret) error {
 	transport, err := storage.OpenGit(repositoryURL)
 	if err != nil {
@@ -203,9 +248,6 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 	if err != nil {
 		return err
 	}
-	if len(current.Repository.LogicalRefs) != 0 {
-		return errors.New("ticket #11 supports only the ordinary first push")
-	}
 	state, err := gitdb.ReadState(logicalGitDirectory)
 	if err != nil {
 		return err
@@ -213,9 +255,43 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 	if state.LogicalHEAD != current.Repository.LogicalHEAD || state.ObjectFormat != current.Repository.ObjectFormat {
 		return errors.New("pushed Logical Repository identity does not match initialized Ciphertext Repository")
 	}
-	payload, err := gitdb.CreatePack(logicalGitDirectory)
+	reachableObjectIDs, err := gitdb.ReachableObjectIDs(logicalGitDirectory)
 	if err != nil {
 		return err
+	}
+	liveObjects := make(map[string]struct{}, len(reachableObjectIDs))
+	for _, objectID := range reachableObjectIDs {
+		liveObjects[objectID] = struct{}{}
+	}
+	packs := make([]cloakformat.PackPayload, 0, len(current.Packs)+1)
+	coveredObjects := make(map[string]struct{})
+	for _, payload := range current.Packs {
+		live := false
+		for _, objectID := range payload.ObjectIDs {
+			if _, exists := liveObjects[objectID]; exists {
+				live = true
+			}
+		}
+		if !live {
+			continue
+		}
+		packs = append(packs, payload)
+		for _, objectID := range payload.ObjectIDs {
+			coveredObjects[objectID] = struct{}{}
+		}
+	}
+	newObjectIDs := make([]string, 0)
+	for _, objectID := range reachableObjectIDs {
+		if _, exists := coveredObjects[objectID]; !exists {
+			newObjectIDs = append(newObjectIDs, objectID)
+		}
+	}
+	if len(newObjectIDs) > 0 {
+		payload, err := gitdb.CreatePackForObjects(logicalGitDirectory, newObjectIDs)
+		if err != nil {
+			return err
+		}
+		packs = append(packs, payload)
 	}
 	repository := cloakformat.SnapshotState{
 		RepositoryID: current.Repository.RepositoryID, Generation: current.Repository.Generation + 1,
@@ -223,7 +299,7 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 		PreviousStorageRef: storageCommitID,
 	}
 	encoded, err := engine.formats.EncodeSnapshot(secret, cloakformat.SnapshotInput{
-		Repository: repository, Packs: []cloakformat.PackPayload{payload},
+		Repository: repository, Packs: packs,
 	})
 	if err != nil {
 		return err
@@ -249,6 +325,13 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 	if candidateState.LogicalHEAD != state.LogicalHEAD || candidateState.ObjectFormat != state.ObjectFormat || !maps.Equal(candidateState.LogicalRefs, state.LogicalRefs) {
 		return errors.New("candidate Ciphertext Snapshot does not preserve the intended Logical Repository state")
 	}
+	candidateObjectIDs, err := gitdb.ReachableObjectIDs(temporary)
+	if err != nil {
+		return err
+	}
+	if strings.Join(candidateObjectIDs, "\n") != strings.Join(reachableObjectIDs, "\n") {
+		return errors.New("candidate Ciphertext Snapshot does not preserve the intended reachable Git objects")
+	}
 	_, err = transport.PublishSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
 	return err
 }
@@ -262,10 +345,24 @@ func (engine *Engine) FetchInto(repositoryURL, gitDirectory string, secret domai
 	return gitdb.Import(gitDirectory, decoded.Packs)
 }
 
-// PublishRef applies the ticket #11 direct remote-helper push to one protected branch.
+// RefUpdate is one requested Logical Ref change in an atomic push transaction.
+type RefUpdate struct {
+	Source      domain.LogicalRefName
+	Destination domain.LogicalRefName
+	Force       bool
+}
+
+// PublishRef applies one direct remote-helper ref update.
 func (engine *Engine) PublishRef(repositoryURL, sourceGitDirectory, sourceRef, destinationRef string, force bool, secret domain.RecoverySecret) error {
-	if !strings.HasPrefix(sourceRef, "refs/") || !strings.HasPrefix(destinationRef, "refs/heads/") {
-		return errors.New("ticket #11 requires one branch-to-branch push")
+	return engine.PublishRefs(repositoryURL, sourceGitDirectory, []RefUpdate{{
+		Source: domain.LogicalRefName(sourceRef), Destination: domain.LogicalRefName(destinationRef), Force: force,
+	}}, secret)
+}
+
+// PublishRefs applies every requested Logical Ref change and publishes one snapshot or none.
+func (engine *Engine) PublishRefs(repositoryURL, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret) error {
+	if len(updates) == 0 {
+		return errors.New("push transaction contains no Logical Ref updates")
 	}
 	temporaryRoot, err := os.MkdirTemp("", "git-remote-cloak-receive-")
 	if err != nil {
@@ -276,14 +373,26 @@ func (engine *Engine) PublishRef(repositoryURL, sourceGitDirectory, sourceRef, d
 	if err := engine.RecoverBare(repositoryURL, temporary, secret); err != nil {
 		return err
 	}
-	refspec := sourceRef + ":" + destinationRef
-	if force {
-		refspec = "+" + refspec
-	}
-	command := exec.Command("git", "--git-dir="+temporary, "fetch", "--no-tags", sourceGitDirectory, refspec)
-	command.Env = append(cleanGitEnvironment(os.Environ()), "GIT_CONFIG_NOSYSTEM=1")
-	if output, err := command.CombinedOutput(); err != nil {
-		return fmt.Errorf("receive pushed Logical Ref: %s", strings.TrimSpace(string(output)))
+	for _, update := range updates {
+		source, destination := string(update.Source), string(update.Destination)
+		if !update.Destination.IsSupported() || source != "" && !strings.HasPrefix(source, "refs/") {
+			return errors.New("push requires branch or tag refs")
+		}
+		if source == "" {
+			if _, err := git(temporary, nil, "update-ref", "-d", destination); err != nil {
+				return fmt.Errorf("delete Logical Ref %s: %w", destination, err)
+			}
+			continue
+		}
+		refspec := source + ":" + destination
+		if update.Force {
+			refspec = "+" + refspec
+		}
+		command := exec.Command("git", "--git-dir="+temporary, "fetch", "--no-tags", sourceGitDirectory, refspec)
+		command.Env = append(cleanGitEnvironment(os.Environ()), "GIT_CONFIG_NOSYSTEM=1")
+		if output, err := command.CombinedOutput(); err != nil {
+			return fmt.Errorf("receive pushed Logical Ref: %s", strings.TrimSpace(string(output)))
+		}
 	}
 	return engine.Publish(repositoryURL, temporary, secret)
 }

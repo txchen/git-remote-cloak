@@ -19,7 +19,8 @@ bootstrap-header = {
   5: 33554432,       ; maximum plaintext chunk size
   6: uint,           ; storage generation
   7: tstr .size 52,  ; lowercase unpadded Base32 manifest locator
-  8: bytes .size 32  ; HMAC-SHA-256 header authenticator
+  8: bytes .size 32, ; HMAC-SHA-256 header authenticator
+  ? 9: tstr          ; previous Storage Ref for generations after initialization
 }
 
 empty-manifest = {
@@ -29,6 +30,21 @@ empty-manifest = {
   4: {*1024 tstr => bytes}, ; encrypted Logical Refs
   5: [*1024 tstr],          ; live Pack Payload identifiers
   6: [*64 uint]             ; required snapshot features
+}
+
+snapshot-manifest = {
+  1: uint,                         ; storage generation
+  2: "sha1" / "sha256",
+  3: tstr .size (1..1024),         ; encrypted Logical HEAD
+  4: {*1024 tstr => bytes},        ; encrypted Logical Refs
+  5: [*1024 pack-payload-location],
+  6: [*64 uint]                    ; required snapshot features
+}
+
+pack-payload-location = {
+  1: bytes .size 16, ; Pack Payload identity
+  2: tstr .size 52,  ; encrypted index locator
+  ? 3: uint          ; legacy authentication generation; absent means reusable generation 0
 }
 
 ; Encrypted Manifest plaintext is bounded to 1 MiB before allocation.

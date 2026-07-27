@@ -38,7 +38,7 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 	reader := bufio.NewScanner(input)
 	writer := bufio.NewWriter(output)
 	inFetchBatch := false
-	pushes := make([]directPush, 0, 1)
+	pushes := make([]engine.RefUpdate, 0, 1)
 	for reader.Scan() {
 		command := reader.Text()
 		switch {
@@ -83,27 +83,25 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 				return err
 			}
 		case command == "" && len(pushes) > 0:
-			if len(pushes) != 1 {
+			gitDirectory, err := currentGitDirectory()
+			if err == nil {
+				err = repositoryEngine.PublishRefs(repositoryURL, gitDirectory, pushes, recoverySecret)
+			}
+			if err != nil {
 				for _, push := range pushes {
-					fmt.Fprintf(writer, "error %s ticket #11 supports exactly one protected branch\n", push.destination)
+					if _, writeErr := fmt.Fprintf(writer, "error %s %s\n", push.Destination, singleLine(err.Error())); writeErr != nil {
+						return writeErr
+					}
 				}
 				_, _ = fmt.Fprint(writer, "\n")
 				return writer.Flush()
 			}
-			push := pushes[0]
-			gitDirectory, err := currentGitDirectory()
-			if err == nil {
-				err = repositoryEngine.PublishRef(repositoryURL, gitDirectory, push.source, push.destination, push.force, recoverySecret)
-			}
-			if err != nil {
-				if _, writeErr := fmt.Fprintf(writer, "error %s %s\n\n", push.destination, singleLine(err.Error())); writeErr != nil {
-					return writeErr
+			for _, push := range pushes {
+				if _, err := fmt.Fprintf(writer, "ok %s\n", push.Destination); err != nil {
+					return err
 				}
-				return writer.Flush()
 			}
-			if _, err := fmt.Fprintf(writer, "ok %s\n\n", push.destination); err != nil {
-				return err
-			}
+			_, _ = fmt.Fprint(writer, "\n")
 			return writer.Flush()
 		case command == "":
 			if len(repository.LogicalRefs) == 0 {
@@ -115,7 +113,7 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 		case strings.HasPrefix(command, "fetch "):
 			inFetchBatch = true
 		case strings.HasPrefix(command, "push "):
-			push, err := parseDirectPush(strings.TrimPrefix(command, "push "))
+			push, err := parseRefUpdate(strings.TrimPrefix(command, "push "))
 			if err != nil {
 				return err
 			}
@@ -152,22 +150,18 @@ func secureEmptyGitCloneScaffold() error {
 	return nil
 }
 
-type directPush struct {
-	source      string
-	destination string
-	force       bool
-}
-
-func parseDirectPush(refspec string) (directPush, error) {
-	push := directPush{}
+func parseRefUpdate(refspec string) (engine.RefUpdate, error) {
+	push := engine.RefUpdate{}
 	if strings.HasPrefix(refspec, "+") {
-		push.force = true
+		push.Force = true
 		refspec = strings.TrimPrefix(refspec, "+")
 	}
 	var found bool
-	push.source, push.destination, found = strings.Cut(refspec, ":")
-	if !found || push.source == "" || push.destination == "" {
-		return directPush{}, errors.New("ticket #11 requires one branch-to-branch push")
+	source, destination, found := strings.Cut(refspec, ":")
+	push.Source = domain.LogicalRefName(source)
+	push.Destination = domain.LogicalRefName(destination)
+	if !found || push.Destination == "" {
+		return engine.RefUpdate{}, errors.New("push refspec requires a destination")
 	}
 	return push, nil
 }

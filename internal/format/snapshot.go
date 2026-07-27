@@ -35,6 +35,12 @@ type SnapshotState struct {
 type PackPayload struct {
 	Pack      []byte
 	ObjectIDs []string
+	encoded   *encodedPackPayload
+}
+
+type encodedPackPayload struct {
+	location snapshotPayloadLocation
+	objects  map[string][]byte
 }
 
 // DecodedSnapshot is a fully authenticated logical state and its native packs.
@@ -82,8 +88,9 @@ type snapshotManifest struct {
 }
 
 type snapshotPayloadLocation struct {
-	Identity     []byte `cbor:"1,keyasint"`
-	IndexLocator string `cbor:"2,keyasint"`
+	Identity                 []byte `cbor:"1,keyasint"`
+	IndexLocator             string `cbor:"2,keyasint"`
+	AuthenticationGeneration uint64 `cbor:"3,keyasint,omitempty"`
 }
 
 type snapshotPackIndex struct {
@@ -108,14 +115,26 @@ type snapshotRecordContext struct {
 	ChunkIndex      uint64 `cbor:"11,keyasint,omitempty"`
 }
 
+type encryptedRecord struct {
+	generation      uint64
+	purpose         keyPurpose
+	kind            string
+	payloadIdentity []byte
+	chunkIndex      uint64
+	final           bool
+}
+
 // EncodeSnapshot maps one complete non-empty Logical Repository into a Ciphertext Snapshot.
 func (r *Registry) EncodeSnapshot(secret domain.RecoverySecret, input SnapshotInput) (EncodedSnapshot, error) {
 	repository := input.Repository
 	if err := validateSnapshotRepository(repository); err != nil {
 		return EncodedSnapshot{}, err
 	}
-	if len(input.Packs) == 0 {
+	if len(repository.LogicalRefs) > 0 && len(input.Packs) == 0 {
 		return EncodedSnapshot{}, errors.New("non-empty snapshot requires a Pack Payload")
+	}
+	if len(repository.LogicalRefs) == 0 && len(input.Packs) > 0 {
+		return EncodedSnapshot{}, errors.New("empty snapshot must not retain a Pack Payload")
 	}
 	objects := make(map[string][]byte)
 	payloadLocations := make([]snapshotPayloadLocation, 0, len(input.Packs))
@@ -145,7 +164,9 @@ func (r *Registry) EncodeSnapshot(secret domain.RecoverySecret, input SnapshotIn
 	if err != nil {
 		return EncodedSnapshot{}, fmt.Errorf("encode Encrypted Manifest: %w", err)
 	}
-	manifest, err := r.encryptRecord(secret, repository, manifestEncryptionPurpose, manifestKind, nil, 0, true, manifestPlaintext)
+	manifest, err := r.encryptRecord(secret, repository, encryptedRecord{
+		generation: repository.Generation, purpose: manifestEncryptionPurpose, kind: manifestKind, final: true,
+	}, manifestPlaintext)
 	if err != nil {
 		return EncodedSnapshot{}, err
 	}
@@ -159,6 +180,13 @@ func (r *Registry) EncodeSnapshot(secret domain.RecoverySecret, input SnapshotIn
 }
 
 func (r *Registry) encodePackPayload(secret domain.RecoverySecret, repository SnapshotState, payload PackPayload) (snapshotPayloadLocation, map[string][]byte, error) {
+	if payload.encoded != nil {
+		objects := make(map[string][]byte, len(payload.encoded.objects))
+		for locator, ciphertext := range payload.encoded.objects {
+			objects[locator] = bytes.Clone(ciphertext)
+		}
+		return payload.encoded.location, objects, nil
+	}
 	if len(payload.Pack) == 0 || len(payload.ObjectIDs) == 0 {
 		return snapshotPayloadLocation{}, nil, errors.New("Pack Payload and object index must not be empty")
 	}
@@ -174,7 +202,10 @@ func (r *Registry) encodePackPayload(secret domain.RecoverySecret, repository Sn
 			end = len(payload.Pack)
 		}
 		final := end == len(payload.Pack)
-		chunk, err := r.encryptRecord(secret, repository, packPayloadEncryptionPurpose, packChunkKind, identity, index, final, payload.Pack[offset:end])
+		chunk, err := r.encryptRecord(secret, repository, encryptedRecord{
+			purpose: packPayloadEncryptionPurpose, kind: packChunkKind,
+			payloadIdentity: identity, chunkIndex: index, final: final,
+		}, payload.Pack[offset:end])
 		if err != nil {
 			return snapshotPayloadLocation{}, nil, err
 		}
@@ -200,7 +231,9 @@ func (r *Registry) encodePackPayload(secret domain.RecoverySecret, repository Sn
 	if err != nil {
 		return snapshotPayloadLocation{}, nil, fmt.Errorf("encode Encrypted Pack Index: %w", err)
 	}
-	index, err := r.encryptRecord(secret, repository, packIndexEncryptionPurpose, packIndexKind, identity, 0, true, indexPlaintext)
+	index, err := r.encryptRecord(secret, repository, encryptedRecord{
+		purpose: packIndexEncryptionPurpose, kind: packIndexKind, payloadIdentity: identity, final: true,
+	}, indexPlaintext)
 	if err != nil {
 		return snapshotPayloadLocation{}, nil, err
 	}
@@ -303,7 +336,9 @@ func (r *Registry) DecodeSnapshotFrom(secret domain.RecoverySecret, bootstrap []
 		return DecodedSnapshot{}, errors.New("Encrypted Manifest exceeds the v1 size limit")
 	}
 	repository := SnapshotState{RepositoryID: repositoryID, Generation: header.Generation, PreviousStorageRef: header.PreviousStorageRef}
-	manifestPlaintext, err := r.decryptRecord(secret, repository, manifestEncryptionPurpose, manifestKind, nil, 0, true, manifestCiphertext)
+	manifestPlaintext, err := r.decryptRecord(secret, repository, encryptedRecord{
+		generation: repository.Generation, purpose: manifestEncryptionPurpose, kind: manifestKind, final: true,
+	}, manifestCiphertext)
 	if err != nil {
 		return DecodedSnapshot{}, errors.New("Encrypted Manifest authentication failed")
 	}
@@ -345,7 +380,7 @@ func (r *Registry) DecodeSnapshotFrom(secret domain.RecoverySecret, bootstrap []
 }
 
 func (r *Registry) decodePackPayload(secret domain.RecoverySecret, repository SnapshotState, location snapshotPayloadLocation, resolve func(string) ([]byte, error)) (PackPayload, error) {
-	if len(location.Identity) != 16 || location.IndexLocator == "" {
+	if len(location.Identity) != 16 || location.IndexLocator == "" || location.AuthenticationGeneration > repository.Generation {
 		return PackPayload{}, errors.New("malformed Encrypted Pack Index location")
 	}
 	indexCiphertext, err := resolve(location.IndexLocator)
@@ -355,7 +390,7 @@ func (r *Registry) decodePackPayload(secret domain.RecoverySecret, repository Sn
 	if len(indexCiphertext) < 28 || len(indexCiphertext)-28 > maximumManifestSize {
 		return PackPayload{}, errors.New("Encrypted Pack Index exceeds the v1 size limit")
 	}
-	indexPlaintext, err := r.decryptRecord(secret, repository, packIndexEncryptionPurpose, packIndexKind, location.Identity, 0, true, indexCiphertext)
+	indexPlaintext, authenticationGeneration, err := r.decryptPackIndexRecord(secret, repository, location, indexCiphertext)
 	if err != nil {
 		return PackPayload{}, errors.New("Encrypted Pack Index authentication failed")
 	}
@@ -367,6 +402,7 @@ func (r *Registry) decodePackPayload(secret domain.RecoverySecret, repository Sn
 		return PackPayload{}, errors.New("malformed Encrypted Pack Index")
 	}
 	var pack bytes.Buffer
+	encodedObjects := map[string][]byte{location.IndexLocator: bytes.Clone(indexCiphertext)}
 	for chunkIndex, locator := range index.ChunkLocators {
 		ciphertext, err := resolve(locator)
 		if err != nil || opaqueContentIdentifier(ciphertext) != locator {
@@ -375,8 +411,12 @@ func (r *Registry) decodePackPayload(secret domain.RecoverySecret, repository Sn
 		if len(ciphertext) < 28 || len(ciphertext)-28 > DefaultChunkSize {
 			return PackPayload{}, errors.New("Encrypted Pack Chunk exceeds the fixed plaintext size")
 		}
+		encodedObjects[locator] = bytes.Clone(ciphertext)
 		final := chunkIndex == len(index.ChunkLocators)-1
-		plaintext, err := r.decryptRecord(secret, repository, packPayloadEncryptionPurpose, packChunkKind, location.Identity, uint64(chunkIndex), final, ciphertext)
+		plaintext, err := r.decryptRecord(secret, repository, encryptedRecord{
+			generation: authenticationGeneration, purpose: packPayloadEncryptionPurpose, kind: packChunkKind,
+			payloadIdentity: location.Identity, chunkIndex: uint64(chunkIndex), final: final,
+		}, ciphertext)
 		if err != nil {
 			return PackPayload{}, errors.New("Encrypted Pack Chunk authentication failed")
 		}
@@ -403,11 +443,15 @@ func (r *Registry) decodePackPayload(secret domain.RecoverySecret, repository Sn
 		}
 		objectIDs[i] = hex.EncodeToString(objectID)
 	}
-	return PackPayload{Pack: pack.Bytes(), ObjectIDs: objectIDs}, nil
+	location.AuthenticationGeneration = authenticationGeneration
+	return PackPayload{
+		Pack: pack.Bytes(), ObjectIDs: objectIDs,
+		encoded: &encodedPackPayload{location: location, objects: encodedObjects},
+	}, nil
 }
 
-func (r *Registry) encryptRecord(secret domain.RecoverySecret, repository SnapshotState, purpose keyPurpose, kind string, payloadIdentity []byte, chunkIndex uint64, final bool, plaintext []byte) ([]byte, error) {
-	key, err := derivePayloadKey(secret, repository.RepositoryID, purpose, payloadIdentity)
+func (r *Registry) encryptRecord(secret domain.RecoverySecret, repository SnapshotState, record encryptedRecord, plaintext []byte) ([]byte, error) {
+	key, err := derivePayloadKey(secret, repository.RepositoryID, record.purpose, record.payloadIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -415,23 +459,47 @@ func (r *Registry) encryptRecord(secret domain.RecoverySecret, repository Snapsh
 	if err != nil {
 		return nil, err
 	}
-	associatedData, err := r.snapshotAssociatedData(repository, kind, payloadIdentity, chunkIndex, final, len(plaintext))
+	associatedData, err := r.snapshotAssociatedData(repository, record, len(plaintext))
 	if err != nil {
 		return nil, err
 	}
 	ciphertext, err := primitive.Encrypt(plaintext, associatedData)
 	if err != nil {
-		return nil, fmt.Errorf("encrypt %s: %w", kind, err)
+		return nil, fmt.Errorf("encrypt %s: %w", record.kind, err)
 	}
 	return ciphertext, nil
 }
 
-func (r *Registry) decryptRecord(secret domain.RecoverySecret, repository SnapshotState, purpose keyPurpose, kind string, payloadIdentity []byte, chunkIndex uint64, final bool, ciphertext []byte) ([]byte, error) {
+func (r *Registry) decryptPackIndexRecord(secret domain.RecoverySecret, repository SnapshotState, location snapshotPayloadLocation, ciphertext []byte) ([]byte, uint64, error) {
+	if location.AuthenticationGeneration != 0 {
+		plaintext, err := r.decryptRecord(secret, repository, encryptedRecord{
+			generation: location.AuthenticationGeneration, purpose: packIndexEncryptionPurpose,
+			kind: packIndexKind, payloadIdentity: location.Identity, final: true,
+		}, ciphertext)
+		return plaintext, location.AuthenticationGeneration, err
+	}
+	plaintext, err := r.decryptRecord(secret, repository, encryptedRecord{
+		purpose: packIndexEncryptionPurpose, kind: packIndexKind, payloadIdentity: location.Identity, final: true,
+	}, ciphertext)
+	if err == nil {
+		return plaintext, 0, nil
+	}
+	plaintext, legacyErr := r.decryptRecord(secret, repository, encryptedRecord{
+		generation: repository.Generation, purpose: packIndexEncryptionPurpose,
+		kind: packIndexKind, payloadIdentity: location.Identity, final: true,
+	}, ciphertext)
+	if legacyErr == nil {
+		return plaintext, repository.Generation, nil
+	}
+	return nil, 0, err
+}
+
+func (r *Registry) decryptRecord(secret domain.RecoverySecret, repository SnapshotState, record encryptedRecord, ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) < 28 {
 		return nil, errors.New("encrypted record is truncated")
 	}
 	plaintextLength := len(ciphertext) - 28
-	key, err := derivePayloadKey(secret, repository.RepositoryID, purpose, payloadIdentity)
+	key, err := derivePayloadKey(secret, repository.RepositoryID, record.purpose, record.payloadIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -439,18 +507,18 @@ func (r *Registry) decryptRecord(secret domain.RecoverySecret, repository Snapsh
 	if err != nil {
 		return nil, err
 	}
-	associatedData, err := r.snapshotAssociatedData(repository, kind, payloadIdentity, chunkIndex, final, plaintextLength)
+	associatedData, err := r.snapshotAssociatedData(repository, record, plaintextLength)
 	if err != nil {
 		return nil, err
 	}
 	return primitive.Decrypt(ciphertext, associatedData)
 }
 
-func (r *Registry) snapshotAssociatedData(repository SnapshotState, kind string, payloadIdentity []byte, chunkIndex uint64, final bool, plaintextLength int) ([]byte, error) {
+func (r *Registry) snapshotAssociatedData(repository SnapshotState, record encryptedRecord, plaintextLength int) ([]byte, error) {
 	return r.encode.Marshal(snapshotRecordContext{
 		Protocol: "git-remote-cloak", FormatMajor: FormatMajor, FormatMinor: FormatMinor, Suite: CryptographicSuite,
-		RepositoryID: repository.RepositoryID[:], RecordKind: kind, Generation: repository.Generation,
-		Final: final, PlaintextLen: uint64(plaintextLength), PayloadIdentity: payloadIdentity, ChunkIndex: chunkIndex,
+		RepositoryID: repository.RepositoryID[:], RecordKind: record.kind, Generation: record.generation,
+		Final: record.final, PlaintextLen: uint64(plaintextLength), PayloadIdentity: record.payloadIdentity, ChunkIndex: record.chunkIndex,
 	})
 }
 
@@ -486,19 +554,16 @@ func validateSnapshotRepository(repository SnapshotState) error {
 		return errors.New("invalid Logical Repository metadata")
 	}
 	if len(repository.LogicalRefs) == 0 {
-		return errors.New("non-empty snapshot requires a Logical Ref")
+		return nil
 	}
 	objectIDBytes := 20
 	if repository.ObjectFormat == "sha256" {
 		objectIDBytes = 32
 	}
 	for name, objectID := range repository.LogicalRefs {
-		if !strings.HasPrefix(name, "refs/heads/") || len(name) > 1024 || len(objectID) != objectIDBytes*2 {
+		if !domain.LogicalRefName(name).IsSupported() || len(name) > 1024 || len(objectID) != objectIDBytes*2 {
 			return errors.New("invalid Logical Ref metadata")
 		}
-	}
-	if _, exists := repository.LogicalRefs[string(repository.LogicalHEAD)]; !exists {
-		return errors.New("Logical HEAD does not select a published Logical Ref")
 	}
 	return nil
 }
