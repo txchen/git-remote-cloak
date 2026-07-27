@@ -1,0 +1,13 @@
+; Canonical associated data for a v1 encrypted record.
+
+record-context = {
+  1: "git-remote-cloak",
+  2: 1,                    ; format major
+  3: 0,                    ; format minor
+  4: 1,                    ; AES-256-GCM-SIV RAW suite
+  5: bytes .size 16,       ; Repository ID
+  6: "encrypted-manifest" / "encrypted-pack-index" / "encrypted-pack-chunk",
+  7: uint,                 ; storage generation
+  8: bool,                 ; authenticated final-record marker
+  9: uint                  ; plaintext length
+}

@@ -1,0 +1,153 @@
+// Package storage provides the ordinary-Git Storage Transport seam.
+package storage
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+const StorageRef = "refs/heads/cloak-storage"
+
+// Snapshot is the byte representation read through the Storage Transport.
+type Snapshot struct {
+	Bootstrap []byte
+	Manifest  []byte
+}
+
+// LocalBare is a deterministic adapter for a local bare Repository Host.
+type LocalBare struct {
+	path       string
+	zeroObject string
+}
+
+// OpenLocalBare validates and opens a local path or file URL.
+func OpenLocalBare(repositoryURL string) (*LocalBare, error) {
+	path := repositoryURL
+	if strings.HasPrefix(repositoryURL, "file://") {
+		parsed, err := url.Parse(repositoryURL)
+		if err != nil || parsed.Host != "" {
+			return nil, errors.New("unsupported local Repository Host URL")
+		}
+		path = parsed.Path
+	}
+	if !filepath.IsAbs(path) {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return nil, err
+		}
+		path = absolute
+	}
+	if output, err := runGit(path, nil, "rev-parse", "--is-bare-repository"); err != nil || strings.TrimSpace(string(output)) != "true" {
+		return nil, errors.New("Repository Host is not a local bare Git repository")
+	}
+	objectFormat, err := runGit(path, nil, "rev-parse", "--show-object-format")
+	if err != nil {
+		return nil, fmt.Errorf("read Repository Host object format: %w", err)
+	}
+	zeroObject := strings.Repeat("0", 40)
+	if strings.TrimSpace(string(objectFormat)) == "sha256" {
+		zeroObject = strings.Repeat("0", 64)
+	}
+	return &LocalBare{path: path, zeroObject: zeroObject}, nil
+}
+
+// Refs returns every public ref on the Repository Host.
+func (transport *LocalBare) Refs() ([]string, error) {
+	output, err := runGit(transport.path, nil, "for-each-ref", "--format=%(refname)")
+	if err != nil {
+		return nil, err
+	}
+	if len(output) == 0 {
+		return nil, nil
+	}
+	return strings.Fields(string(output)), nil
+}
+
+// Read obtains the current complete empty Ciphertext Snapshot.
+func (transport *LocalBare) Read() (Snapshot, error) {
+	bootstrap, err := runGit(transport.path, nil, "show", StorageRef+":bootstrap")
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("read Bootstrap Header: %w", err)
+	}
+	paths, err := runGit(transport.path, nil, "ls-tree", "-r", "--name-only", StorageRef, "objects")
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("list encrypted manifest: %w", err)
+	}
+	objectPaths := strings.Fields(string(paths))
+	if len(objectPaths) != 1 || !strings.HasPrefix(objectPaths[0], "objects/") {
+		return Snapshot{}, errors.New("Ciphertext Snapshot does not contain exactly one Encrypted Manifest")
+	}
+	manifest, err := runGit(transport.path, nil, "show", StorageRef+":"+objectPaths[0])
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("read Encrypted Manifest: %w", err)
+	}
+	return Snapshot{Bootstrap: bootstrap, Manifest: manifest}, nil
+}
+
+// PublishEmpty uploads immutable objects and compare-and-swap creates the Storage Ref.
+func (transport *LocalBare) PublishEmpty(bootstrap, manifest []byte, locator string) error {
+	bootstrapOID, err := transport.writeBlob(bootstrap)
+	if err != nil {
+		return err
+	}
+	manifestOID, err := transport.writeBlob(manifest)
+	if err != nil {
+		return err
+	}
+	objectsTree, err := runGit(transport.path, []byte(fmt.Sprintf("100644 blob %s\t%s\n", manifestOID, locator)), "mktree")
+	if err != nil {
+		return fmt.Errorf("build ciphertext objects tree: %w", err)
+	}
+	rootInput := fmt.Sprintf("100644 blob %s\tbootstrap\n040000 tree %s\tobjects\n", bootstrapOID, strings.TrimSpace(string(objectsTree)))
+	rootTree, err := runGit(transport.path, []byte(rootInput), "mktree")
+	if err != nil {
+		return fmt.Errorf("build Ciphertext Snapshot tree: %w", err)
+	}
+	commit, err := runGit(transport.path, []byte("cloak snapshot\n"), "commit-tree", strings.TrimSpace(string(rootTree)))
+	if err != nil {
+		return fmt.Errorf("build Storage commit: %w", err)
+	}
+	if _, err := runGit(transport.path, nil, "update-ref", StorageRef, strings.TrimSpace(string(commit)), transport.zeroObject); err != nil {
+		return fmt.Errorf("publish Storage Ref: %w", err)
+	}
+	return nil
+}
+
+func (transport *LocalBare) writeBlob(contents []byte) (string, error) {
+	output, err := runGit(transport.path, contents, "hash-object", "-w", "--stdin")
+	if err != nil {
+		return "", fmt.Errorf("upload immutable ciphertext object: %w", err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func runGit(gitDirectory string, stdin []byte, arguments ...string) ([]byte, error) {
+	fullArguments := append([]string{"--git-dir=" + gitDirectory}, arguments...)
+	command := exec.Command("git", fullArguments...)
+	command.Env = append(os.Environ(),
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=git-remote-cloak",
+		"GIT_AUTHOR_EMAIL=cloak@invalid",
+		"GIT_COMMITTER_NAME=git-remote-cloak",
+		"GIT_COMMITTER_EMAIL=cloak@invalid",
+		"GIT_AUTHOR_DATE=2000-01-01T00:00:00Z",
+		"GIT_COMMITTER_DATE=2000-01-01T00:00:00Z",
+	)
+	if stdin != nil {
+		command.Stdin = bytes.NewReader(stdin)
+	}
+	output, err := command.Output()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("git %s: %s", strings.Join(arguments, " "), strings.TrimSpace(string(exitError.Stderr)))
+		}
+		return nil, err
+	}
+	return output, nil
+}

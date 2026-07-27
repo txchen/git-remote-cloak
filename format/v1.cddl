@@ -1,0 +1,35 @@
+; git-remote-cloak repository format v1.0
+; Integers are unsigned and maps use deterministic CBOR (RFC 8949 §4.2.1).
+
+; bootstrap-preamble is a non-CBOR fixed-width record. Its octet layout is
+; normative here:
+;   0..7   = h'434c4f414b000000' (Cloak magic)
+;   8      = 1 (bootstrap framing)
+;   9      = 1 (format major)
+;   10     = 0 (format minor)
+;   11     = 0 (v1 required-feature set is empty; other values fail closed)
+;   12..15 = Bootstrap Header byte length as big-endian uint32, 1..65536
+bootstrap-preamble = bytes .size 16
+
+bootstrap-header = {
+  1: bytes .size 16, ; Repository ID
+  2: 1,              ; format major
+  3: 0,              ; format minor
+  4: 1,              ; AES-256-GCM-SIV RAW suite
+  5: 33554432,       ; maximum plaintext chunk size
+  6: uint,           ; storage generation
+  7: tstr .size 52,  ; lowercase unpadded Base32 manifest locator
+  8: bytes .size 32  ; HMAC-SHA-256 header authenticator
+}
+
+empty-manifest = {
+  1: uint,           ; storage generation
+  2: "sha1" / "sha256",
+  3: tstr .size (1..1024), ; encrypted Logical HEAD
+  4: {*1024 tstr => bytes}, ; encrypted Logical Refs
+  5: [*1024 tstr],          ; live Pack Payload identifiers
+  6: [*64 uint]             ; required snapshot features
+}
+
+; Encrypted Manifest plaintext is bounded to 1 MiB before allocation.
+encrypted-record = bytes ; 96-bit nonce || ciphertext || 128-bit tag
