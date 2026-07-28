@@ -38,12 +38,10 @@ func TestInteractiveInitDisplaysMnemonicOnceAndRequiresConfirmation(t *testing.T
 	if mnemonic == "" {
 		t.Fatalf("no 24-word Recovery Mnemonic in output:\n%s", transcript)
 	}
-	if _, err := terminal.WriteString("SAVED\n"); err != nil {
+	if _, err := terminal.WriteString("SAVED\r"); err != nil {
 		t.Fatal(err)
 	}
-	if err := command.Wait(); err != nil {
-		t.Fatalf("interactive init failed: %v\n%s", err, transcript)
-	}
+	waitForInteractiveCommand(t, command, transcript)
 	if got := mustGit(t, repositoryHost, "for-each-ref", "--format=%(refname)"); got != "refs/heads/cloak-storage\n" {
 		t.Fatalf("Repository Host refs = %q", got)
 	}
@@ -53,6 +51,22 @@ func TestInteractiveInitDisplaysMnemonicOnceAndRequiresConfirmation(t *testing.T
 	clone.Env = append(withoutEnvironment(os.Environ(), "CLOAK_RECOVERY_SECRET", "CLOAK_RECOVERY_SECRET_FILE"), "CLOAK_RECOVERY_SECRET="+mnemonic)
 	if output, err := clone.CombinedOutput(); err != nil {
 		t.Fatalf("generated Recovery Mnemonic could not recover repository: %v\n%s", err, output)
+	}
+}
+
+func waitForInteractiveCommand(t *testing.T, command *exec.Cmd, transcript string) {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() { result <- command.Wait() }()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("interactive init failed: %v\n%s", err, transcript)
+		}
+	case <-time.After(10 * time.Second):
+		_ = command.Process.Kill()
+		<-result
+		t.Fatalf("interactive init did not exit after confirmation\n%s", transcript)
 	}
 }
 
