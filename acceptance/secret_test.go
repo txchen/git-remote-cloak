@@ -38,9 +38,10 @@ func TestInteractiveInitDisplaysMnemonicOnceAndRequiresConfirmation(t *testing.T
 	if mnemonic == "" {
 		t.Fatalf("no 24-word Recovery Mnemonic in output:\n%s", transcript)
 	}
-	if _, err := terminal.WriteString("SAVED\n"); err != nil {
+	if _, err := terminal.WriteString("SAVED\r\n"); err != nil {
 		t.Fatal(err)
 	}
+	transcript += readPTYUntil(t, terminal, "Initialized Ciphertext Repository for remote backup.")
 	waitForInteractiveCommand(t, command, transcript)
 	if got := mustGit(t, repositoryHost, "for-each-ref", "--format=%(refname)"); got != "refs/heads/cloak-storage\n" {
 		t.Fatalf("Repository Host refs = %q", got)
