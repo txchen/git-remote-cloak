@@ -48,6 +48,8 @@ func run(arguments []string) error {
 		return runCompact(arguments[1:])
 	case "rekey":
 		return runRekey(arguments[1:])
+	case "migrate":
+		return runMigrate(arguments[1:])
 	default:
 		if len(arguments) == 2 {
 			recoverySecret, err := acquireSecret("", false)
@@ -65,6 +67,99 @@ func run(arguments []string) error {
 		}
 		return usageError()
 	}
+}
+
+func runMigrate(arguments []string) error {
+	remoteName, target, confirmed, dryRun, _, err := parseMigrationArguments(arguments)
+	if err != nil {
+		return err
+	}
+	recoverySecret, err := acquireSecret("", false)
+	if err != nil {
+		return err
+	}
+	workspace, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	gitDirectory, err := absoluteGitDirectory()
+	if err != nil {
+		return errors.New("migrate must run inside an Authorized Host Git repository")
+	}
+	configuredURL, err := exec.Command("git", "-C", workspace, "remote", "get-url", remoteName).Output()
+	if err != nil {
+		return fmt.Errorf("read Cloak remote %s", remoteName)
+	}
+	repositoryURL, found := strings.CutPrefix(strings.TrimSpace(string(configuredURL)), "cloak::")
+	if !found || repositoryURL == "" {
+		return errors.New("configured remote is not a Cloak remote")
+	}
+	repositoryEngine := engine.NewWithLocalState(gitDirectory)
+	plan, err := repositoryEngine.PlanMigration(repositoryURL, target, recoverySecret)
+	if err != nil {
+		return err
+	}
+	if dryRun {
+		return json.NewEncoder(os.Stdout).Encode(plan)
+	}
+	fmt.Printf("Format Migration plan: %s -> %s\n", plan.CurrentFormat, plan.TargetFormat)
+	fmt.Printf("Authenticated Ciphertext Repository state: %d Logical Refs\n", plan.LogicalRefCount)
+	fmt.Printf("Estimated full upload: %d bytes\n", plan.EstimatedFullUploadBytes)
+	fmt.Printf("Compatibility check: %s\nCapacity check: %s\n", plan.CompatibilityCheck, plan.CapacityCheck)
+	fmt.Printf("Target writer compatibility: %s\n", plan.WriterCompatibilityEffect)
+	if !confirmed {
+		fmt.Print("Type MIGRATE to publish the parentless target-format Ciphertext Snapshot: ")
+		answer, readErr := bufio.NewReader(os.Stdin).ReadString('\n')
+		if readErr != nil && len(answer) == 0 {
+			return fmt.Errorf("read Format Migration confirmation: %w", readErr)
+		}
+		if strings.TrimSpace(answer) != "MIGRATE" {
+			return errors.New("Format Migration cancelled; Ciphertext Repository was not changed")
+		}
+	}
+	if err := repositoryEngine.Migrate(repositoryURL, plan, recoverySecret, func(phase string) {
+		fmt.Printf("%s Format Migration candidate.\n", phase)
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("Format Migration published a validated %s Ciphertext Snapshot with one parentless Storage History root.\n", plan.TargetFormat)
+	fmt.Println("Warning: Repository Host retention may preserve superseded ciphertext; Format Migration cannot guarantee erasure or immediate quota recovery.")
+	return nil
+}
+
+func parseMigrationArguments(arguments []string) (remoteName, target string, confirmed, dryRun, structured bool, err error) {
+	for index := 0; index < len(arguments); index++ {
+		switch arguments[index] {
+		case "--to":
+			index++
+			if index >= len(arguments) || target != "" {
+				return "", "", false, false, false, migrationUsageError()
+			}
+			target = arguments[index]
+		case "--yes":
+			if confirmed {
+				return "", "", false, false, false, migrationUsageError()
+			}
+			confirmed = true
+		case "--dry-run":
+			dryRun = true
+		case "--json":
+			structured = true
+		default:
+			if strings.HasPrefix(arguments[index], "-") || remoteName != "" {
+				return "", "", false, false, false, migrationUsageError()
+			}
+			remoteName = arguments[index]
+		}
+	}
+	if remoteName == "" || confirmed && target == "" || dryRun && target == "" || dryRun != structured || dryRun && confirmed {
+		return "", "", false, false, false, migrationUsageError()
+	}
+	return remoteName, target, confirmed, dryRun, structured, nil
+}
+
+func migrationUsageError() error {
+	return errors.New("usage: git-remote-cloak migrate <remote-name> [--to <format> --yes | --to <format> --dry-run --json]")
 }
 
 func runRekey(arguments []string) error {
@@ -515,7 +610,7 @@ func acquireSecret(explicitFile string, allowGeneration bool) (domain.RecoverySe
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: git-remote-cloak <init|clone|rekey|compact|cache|doctor|set-head|status|version>")
+	return fmt.Errorf("usage: git-remote-cloak <init|clone|rekey|migrate|compact|cache|doctor|set-head|status|version>")
 }
 
 func absoluteGitDirectory() (string, error) {

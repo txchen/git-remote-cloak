@@ -48,15 +48,40 @@ type RekeyResult struct {
 	RepositoryID domain.RepositoryID
 }
 
+// MigrationPlan is the authenticated, read-only plan shown before Format Migration.
+type MigrationPlan struct {
+	CurrentFormat             string `json:"current_format"`
+	TargetFormat              string `json:"target_format"`
+	LogicalRefCount           int    `json:"logical_ref_count"`
+	EstimatedFullUploadBytes  uint64 `json:"estimated_full_upload_bytes"`
+	CompatibilityCheck        string `json:"compatibility_check"`
+	CapacityCheck             string `json:"capacity_check"`
+	WriterCompatibilityEffect string `json:"writer_compatibility_effect"`
+
+	targetFormat            cloakformat.Format
+	startingStorageCommitID string
+	repositoryID            domain.RepositoryID
+	startingGeneration      uint64
+	intentID                string
+	alreadyPublished        bool
+}
+
 func defaultPublishOptions() PublishOptions { return PublishOptions{AutoCompact: true} }
 
 // New returns a production Repository Engine.
-func New() *Engine { return &Engine{formats: cloakformat.NewRegistry()} }
+func New() *Engine { return &Engine{formats: runtimeRegistry()} }
 
 // NewWithLocalState returns an Engine that may reuse Secret-free persistent
 // state owned by gitDirectory.
 func NewWithLocalState(gitDirectory string) *Engine {
-	return &Engine{formats: cloakformat.NewRegistry(), localGitDirectory: gitDirectory}
+	return &Engine{formats: runtimeRegistry(), localGitDirectory: gitDirectory}
+}
+
+func runtimeRegistry() *cloakformat.Registry {
+	if os.Getenv("CLOAK_TEST_FORMATS") == "1" {
+		return cloakformat.NewRegistryForTesting()
+	}
+	return cloakformat.NewRegistry()
 }
 
 // PlanRekey selects local authority without reading or authenticating the
@@ -441,6 +466,185 @@ func (engine *Engine) Compact(repositoryURL string, secret domain.RecoverySecret
 	return localstate.RemoveTransaction(engine.localGitDirectory, intentID)
 }
 
+// PlanMigration authenticates the current Ciphertext Repository state and performs all
+// read-only compatibility, capacity-estimate, and candidate planning checks.
+func (engine *Engine) PlanMigration(repositoryURL, target string, secret domain.RecoverySecret) (MigrationPlan, error) {
+	var targetFormat cloakformat.Format
+	var err error
+	if target == "" {
+		targetFormat, err = engine.formats.DefaultWriter()
+	} else {
+		targetFormat, err = engine.formats.ParseFormat(target)
+	}
+	if err != nil {
+		return MigrationPlan{}, err
+	}
+	if err := engine.formats.RequireWriter(targetFormat); err != nil {
+		return MigrationPlan{}, err
+	}
+	transport, err := storage.OpenGit(repositoryURL)
+	if err != nil {
+		return MigrationPlan{}, err
+	}
+	defer transport.Close()
+	current, storageCommitID, err := engine.decodeTransportSnapshotWithoutMutation(secret, transport)
+	if err != nil {
+		return MigrationPlan{}, err
+	}
+	if current.Repository.Format == targetFormat {
+		if source := current.Repository.MigrationSource; source != nil {
+			intentID, intentErr := migrationIntentID(secret, current.Repository.RepositoryID, source.StorageRef, targetFormat)
+			transaction, valid := localstate.LoadTransaction(engine.localGitDirectory, intentID, secret, current.Repository.RepositoryID)
+			if intentErr == nil && valid && transaction.Operation == localstate.MigrationOperation &&
+				transaction.StartingStorageCommitID == source.StorageRef && transaction.PreparedStorageCommitID == storageCommitID {
+				return MigrationPlan{
+					CurrentFormat: source.Format.String(), TargetFormat: targetFormat.String(),
+					LogicalRefCount: len(current.Repository.LogicalRefs), CompatibilityCheck: "passed", CapacityCheck: "passed",
+					WriterCompatibilityEffect: fmt.Sprintf("future writes require an exact %s writer; binaries without an exact reader cannot access the migrated repository", targetFormat),
+					targetFormat:              targetFormat, startingStorageCommitID: source.StorageRef, repositoryID: current.Repository.RepositoryID,
+					startingGeneration: source.Generation, intentID: intentID, alreadyPublished: true,
+				}, nil
+			}
+		}
+		return MigrationPlan{}, fmt.Errorf("Ciphertext Repository already uses target format %s", targetFormat)
+	}
+	if targetFormat.Major < current.Repository.Format.Major ||
+		targetFormat.Major == current.Repository.Format.Major && targetFormat.Minor < current.Repository.Format.Minor {
+		return MigrationPlan{}, errors.New("v1 does not support in-place repository format downgrade")
+	}
+	encoded, _, err := engine.buildMigrationCandidate(current, storageCommitID, targetFormat, secret, nil)
+	if err != nil {
+		return MigrationPlan{}, err
+	}
+	if _, err := transport.PrepareRootSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects); err != nil {
+		return MigrationPlan{}, fmt.Errorf("check target-format Ciphertext Snapshot capacity: %w", err)
+	}
+	estimatedUpload := uint64(len(encoded.Bootstrap))
+	for _, ciphertext := range encoded.CiphertextObjects {
+		estimatedUpload += uint64(len(ciphertext))
+	}
+	intentID, err := migrationIntentID(secret, current.Repository.RepositoryID, storageCommitID, targetFormat)
+	if err != nil {
+		return MigrationPlan{}, err
+	}
+	return MigrationPlan{
+		CurrentFormat: current.Repository.Format.String(), TargetFormat: targetFormat.String(),
+		LogicalRefCount: len(current.Repository.LogicalRefs), EstimatedFullUploadBytes: estimatedUpload,
+		CompatibilityCheck: "passed", CapacityCheck: "passed",
+		WriterCompatibilityEffect: fmt.Sprintf("future writes require an exact %s writer; binaries without an exact reader cannot access the migrated repository", targetFormat),
+		targetFormat:              targetFormat, startingStorageCommitID: storageCommitID,
+		repositoryID: current.Repository.RepositoryID, startingGeneration: current.Repository.Generation, intentID: intentID,
+	}, nil
+}
+
+// Migrate reconstructs the Logical Repository from the authenticated
+// Ciphertext Snapshot and publishes the planned target through one compare-and-swap.
+func (engine *Engine) Migrate(repositoryURL string, plan MigrationPlan, secret domain.RecoverySecret, progress ProgressFunc) error {
+	if plan.targetFormat == (cloakformat.Format{}) || plan.startingStorageCommitID == "" {
+		return errors.New("Format Migration requires a fresh authenticated plan")
+	}
+	operationLock, err := localstate.AcquireOperationLock(engine.localGitDirectory)
+	if err != nil {
+		return err
+	}
+	defer operationLock.Close()
+	transport, err := storage.OpenGit(repositoryURL)
+	if err != nil {
+		return err
+	}
+	defer transport.Close()
+	current, storageCommitID, err := engine.decodeTransportSnapshot(secret, transport)
+	if err != nil {
+		return err
+	}
+	if plan.alreadyPublished {
+		if storageCommitID != plan.startingStorageCommitID && current.Repository.Format == plan.targetFormat &&
+			current.Repository.MigrationSource != nil && current.Repository.MigrationSource.StorageRef == plan.startingStorageCommitID {
+			return localstate.RemoveTransaction(engine.localGitDirectory, plan.intentID)
+		}
+		return errors.New("recorded Format Migration publication no longer matches the authenticated Ciphertext Repository")
+	}
+	if storageCommitID != plan.startingStorageCommitID || current.Repository.RepositoryID != plan.repositoryID || current.Repository.Generation != plan.startingGeneration {
+		return errors.New("Storage Ref changed concurrently after Migration planning; create a new plan")
+	}
+	encoded, candidate, err := engine.buildMigrationCandidate(current, storageCommitID, plan.targetFormat, secret, progress)
+	if err != nil {
+		return err
+	}
+	reportProgress(progress, "Upload")
+	preparedStorageCommit, err := transport.PrepareRootSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
+	if err != nil {
+		return err
+	}
+	if err := localstate.StoreTransaction(engine.localGitDirectory, localstate.Transaction{
+		IntentID: plan.intentID, StartingStorageCommitID: storageCommitID,
+		PreparedStorageCommitID: preparedStorageCommit, Operation: localstate.MigrationOperation,
+	}, secret, current.Repository.RepositoryID); err != nil {
+		return fmt.Errorf("persist Format Migration crash journal before publication: %w", err)
+	}
+	reportProgress(progress, "Publication")
+	if err := transport.PublishPrepared(storageCommitID, preparedStorageCommit); err != nil {
+		if errors.Is(err, storage.ErrConcurrentUpdate) {
+			return fmt.Errorf("Format Migration aborted because the Storage Ref changed concurrently; create a new plan: %w", err)
+		}
+		verificationTransport, verificationErr := storage.OpenGit(repositoryURL)
+		if verificationErr != nil {
+			return err
+		}
+		observed, currentErr := verificationTransport.Current()
+		_ = verificationTransport.Close()
+		if currentErr != nil || observed != preparedStorageCommit {
+			return err
+		}
+	}
+	if err := localstate.ObserveCheckpoint(engine.localGitDirectory, candidate.Repository.RepositoryID, candidate.Repository.Generation,
+		preparedStorageCommit, storageCommitID, transport.StorageHistoryContinues); err != nil {
+		return err
+	}
+	return localstate.RemoveTransaction(engine.localGitDirectory, plan.intentID)
+}
+
+func (engine *Engine) buildMigrationCandidate(current cloakformat.DecodedSnapshot, storageCommitID string, targetFormat cloakformat.Format, secret domain.RecoverySecret, progress ProgressFunc) (cloakformat.EncodedSnapshot, cloakformat.DecodedSnapshot, error) {
+	temporaryRoot, err := os.MkdirTemp("", "git-remote-cloak-migrate-")
+	if err != nil {
+		return cloakformat.EncodedSnapshot{}, cloakformat.DecodedSnapshot{}, err
+	}
+	defer os.RemoveAll(temporaryRoot)
+	logicalRepository := filepath.Join(temporaryRoot, "repository.git")
+	state := gitdb.State{LogicalHEAD: current.Repository.LogicalHEAD, ObjectFormat: current.Repository.ObjectFormat, LogicalRefs: current.Repository.LogicalRefs}
+	if err := gitdb.Restore(logicalRepository, true, state, current.Packs); err != nil {
+		return cloakformat.EncodedSnapshot{}, cloakformat.DecodedSnapshot{}, fmt.Errorf("reconstruct the authoritative Logical Repository from the authenticated Ciphertext Snapshot: %w", err)
+	}
+	reachableObjectIDs, err := gitdb.ReachableObjectIDs(logicalRepository)
+	if err != nil {
+		return cloakformat.EncodedSnapshot{}, cloakformat.DecodedSnapshot{}, err
+	}
+	repository := current.Repository
+	repository.Format = targetFormat
+	repository.Generation++
+	repository.PreviousStorageRef = storageCommitID
+	repository.MigrationSource = &cloakformat.MigrationSource{Format: current.Repository.Format, Generation: current.Repository.Generation, StorageRef: storageCommitID}
+	encoded, err := engine.buildCompactedSnapshotForObjects(logicalRepository, repository, secret, progress, reachableObjectIDs)
+	if err != nil {
+		return cloakformat.EncodedSnapshot{}, cloakformat.DecodedSnapshot{}, err
+	}
+	reportProgress(progress, "Validation")
+	candidate, err := engine.validateCandidate(secret, encoded, state, reachableObjectIDs)
+	if err != nil {
+		return cloakformat.EncodedSnapshot{}, cloakformat.DecodedSnapshot{}, err
+	}
+	if candidate.Repository.Format != targetFormat || candidate.Repository.Generation != current.Repository.Generation+1 ||
+		candidate.Repository.MigrationSource == nil || candidate.Repository.MigrationSource.Format != current.Repository.Format ||
+		candidate.Repository.MigrationSource.Generation != current.Repository.Generation || candidate.Repository.MigrationSource.StorageRef != storageCommitID {
+		return cloakformat.EncodedSnapshot{}, cloakformat.DecodedSnapshot{}, errors.New("candidate Ciphertext Snapshot does not authenticate the planned Migration source")
+	}
+	return encoded, candidate, nil
+}
+
+func migrationIntentID(secret domain.RecoverySecret, repositoryID domain.RepositoryID, storageCommitID string, targetFormat cloakformat.Format) (string, error) {
+	return localstate.TransactionIntentID(secret, repositoryID, []byte("migration\x00"+storageCommitID+"\x00"+targetFormat.String()))
+}
+
 // Rekey replaces the Storage Ref from a complete selected local Logical
 // Repository without reading or authenticating the old Ciphertext Snapshot.
 func (engine *Engine) Rekey(repositoryURL, logicalGitDirectory string, plan RekeyPlan, secret domain.RecoverySecret, progress ProgressFunc) (RekeyResult, error) {
@@ -475,7 +679,12 @@ func (engine *Engine) Rekey(repositoryURL, logicalGitDirectory string, plan Reke
 	if err != nil {
 		return RekeyResult{}, err
 	}
+	defaultFormat, err := engine.formats.DefaultWriter()
+	if err != nil {
+		return RekeyResult{}, err
+	}
 	repository := cloakformat.SnapshotState{
+		Format:     defaultFormat,
 		Generation: 1, LogicalHEAD: plan.selectedRepository.LogicalHEAD, ObjectFormat: plan.selectedRepository.ObjectFormat,
 		LogicalRefs: maps.Clone(plan.selectedRepository.LogicalRefs),
 	}
@@ -596,6 +805,9 @@ func (engine *Engine) validateCandidate(secret domain.RecoverySecret, encoded cl
 }
 
 func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat.DecodedSnapshot, storageCommitID, logicalGitDirectory string, secret domain.RecoverySecret, options PublishOptions) error {
+	if err := engine.formats.RequireWriter(current.Repository.Format); err != nil {
+		return err
+	}
 	state, err := gitdb.ReadState(logicalGitDirectory)
 	if err != nil {
 		return err
@@ -646,6 +858,7 @@ func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat
 		packs = append(packs, payload)
 	}
 	repository := cloakformat.SnapshotState{
+		Format:       current.Repository.Format,
 		RepositoryID: current.Repository.RepositoryID, Generation: current.Repository.Generation + 1,
 		LogicalHEAD: state.LogicalHEAD, ObjectFormat: state.ObjectFormat, LogicalRefs: state.LogicalRefs,
 		PreviousStorageRef: storageCommitID, CompactedSize: current.Repository.CompactedSize,
@@ -932,6 +1145,35 @@ func (engine *Engine) decodeTransportSnapshot(secret domain.RecoverySecret, tran
 	return decoded, storageCommitID, err
 }
 
+func (engine *Engine) decodeTransportSnapshotWithoutMutation(secret domain.RecoverySecret, transport *storage.Git) (cloakformat.DecodedSnapshot, string, error) {
+	bootstrap, storageCommitID, err := transport.ReadBootstrap()
+	if err != nil {
+		return cloakformat.DecodedSnapshot{}, "", err
+	}
+	decoded, err := engine.decodeValidatedSnapshot(secret, bootstrap, func(locator string) ([]byte, error) {
+		return transport.ReadObject(storageCommitID, locator)
+	})
+	if err != nil {
+		return cloakformat.DecodedSnapshot{}, "", err
+	}
+	return decoded, storageCommitID, nil
+}
+
+func (engine *Engine) decodeValidatedSnapshot(secret domain.RecoverySecret, bootstrap []byte, resolve func(string) ([]byte, error)) (cloakformat.DecodedSnapshot, error) {
+	decoded, err := engine.formats.DecodeSnapshotFrom(secret, bootstrap, resolve)
+	if err != nil {
+		return cloakformat.DecodedSnapshot{}, err
+	}
+	state := gitdb.State{
+		LogicalHEAD: decoded.Repository.LogicalHEAD, ObjectFormat: decoded.Repository.ObjectFormat,
+		LogicalRefs: decoded.Repository.LogicalRefs,
+	}
+	if err := gitdb.ValidateLogicalRepository(state, decoded.Packs); err != nil {
+		return cloakformat.DecodedSnapshot{}, err
+	}
+	return decoded, nil
+}
+
 func (engine *Engine) decodeTransportSnapshotAt(secret domain.RecoverySecret, transport *storage.Git, storageCommitID string, observe bool) (cloakformat.DecodedSnapshot, error) {
 	bootstrap, err := transport.ReadBootstrapAt(storageCommitID)
 	if err != nil {
@@ -943,7 +1185,7 @@ func (engine *Engine) decodeTransportSnapshotAt(secret domain.RecoverySecret, tr
 func (engine *Engine) decodeTransportSnapshotBytes(secret domain.RecoverySecret, transport *storage.Git, bootstrap []byte, storageCommitID string, observe bool) (cloakformat.DecodedSnapshot, error) {
 	cache := localstate.NewCache(engine.localGitDirectory)
 	downloaded := make(map[string][]byte)
-	decoded, err := engine.formats.DecodeSnapshotFrom(secret, bootstrap, func(locator string) ([]byte, error) {
+	decoded, err := engine.decodeValidatedSnapshot(secret, bootstrap, func(locator string) ([]byte, error) {
 		if cached, found := cache.ReadObject(locator); found {
 			return cached, nil
 		}
@@ -957,13 +1199,6 @@ func (engine *Engine) decodeTransportSnapshotBytes(secret domain.RecoverySecret,
 		return cloakformat.DecodedSnapshot{}, err
 	}
 	if observe {
-		state := gitdb.State{
-			LogicalHEAD: decoded.Repository.LogicalHEAD, ObjectFormat: decoded.Repository.ObjectFormat,
-			LogicalRefs: decoded.Repository.LogicalRefs,
-		}
-		if err := gitdb.ValidateLogicalRepository(state, decoded.Packs); err != nil {
-			return cloakformat.DecodedSnapshot{}, err
-		}
 		if err := localstate.ObserveCheckpoint(engine.localGitDirectory, decoded.Repository.RepositoryID, decoded.Repository.Generation, storageCommitID, decoded.Repository.PreviousStorageRef, transport.StorageHistoryContinues); err != nil {
 			return cloakformat.DecodedSnapshot{}, err
 		}

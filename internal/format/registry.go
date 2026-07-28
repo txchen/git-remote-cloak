@@ -67,12 +67,38 @@ type EncodedSnapshot struct {
 
 // Capability reports one exact Ciphertext Repository reader and writer.
 type Capability struct {
+	Format             string   `json:"format"`
 	Major              uint64   `json:"major"`
 	Minor              uint64   `json:"minor"`
 	Read               bool     `json:"read"`
 	Write              bool     `json:"write"`
 	CryptographicSuite string   `json:"cryptographic_suite"`
 	RequiredFeatures   []string `json:"required_features"`
+	TestOnly           bool     `json:"-"`
+}
+
+// Format identifies one exact Ciphertext Repository representation.
+type Format struct {
+	Major uint64
+	Minor uint64
+	name  string
+}
+
+var (
+	V1     = Format{Major: 1, Minor: 0, name: "v1.0"}
+	TestV2 = Format{Major: 2, Minor: 0, name: "test-v2.0"}
+)
+
+func (format Format) String() string { return format.name }
+
+// ErrMigrationRequired reports that a readable format has no registered writer.
+var ErrMigrationRequired = errors.New("repository format migration required before writing")
+
+type registeredFormat struct {
+	format   Format
+	read     bool
+	write    bool
+	testOnly bool
 }
 
 // Registry selects supported readers and writers from a bounded preamble.
@@ -80,6 +106,8 @@ type Registry struct {
 	encode  cbor.EncMode
 	decode  cbor.DecMode
 	newAEAD func([32]byte) (aeadPrimitive, error)
+	formats []registeredFormat
+	active  Format
 }
 
 type aeadPrimitive interface {
@@ -131,6 +159,23 @@ type recordContext struct {
 
 // NewRegistry returns the exact v1 reader and writer registry.
 func NewRegistry() *Registry {
+	return newRegistry([]registeredFormat{{format: V1, read: true, write: true}})
+}
+
+// NewRegistryForTesting adds a second format used only by migration tests.
+func NewRegistryForTesting() *Registry {
+	return newRegistry([]registeredFormat{
+		{format: V1, read: true, write: true},
+		{format: TestV2, read: true, write: true, testOnly: true},
+	})
+}
+
+// NewReadOnlyRegistryForTesting exercises read-without-write compatibility.
+func NewReadOnlyRegistryForTesting() *Registry {
+	return newRegistry([]registeredFormat{{format: V1, read: true}})
+}
+
+func newRegistry(formats []registeredFormat) *Registry {
 	encode, err := cbor.CanonicalEncOptions().EncMode()
 	if err != nil {
 		panic(err)
@@ -146,19 +191,61 @@ func NewRegistry() *Registry {
 	if err != nil {
 		panic(err)
 	}
-	return &Registry{encode: encode, decode: decode, newAEAD: newAESGCMSIV}
+	return &Registry{encode: encode, decode: decode, newAEAD: newAESGCMSIV, formats: formats, active: V1}
 }
 
 // Capabilities returns the exact formats registered for reading and writing.
 func (r *Registry) Capabilities() []Capability {
-	return []Capability{{
-		Major:              FormatMajor,
-		Minor:              FormatMinor,
-		Read:               true,
-		Write:              true,
-		CryptographicSuite: cryptographicSuiteName,
-		RequiredFeatures:   []string{},
-	}}
+	capabilities := make([]Capability, 0, len(r.formats))
+	for _, registered := range r.formats {
+		capabilities = append(capabilities, Capability{
+			Format: registered.format.String(), Major: registered.format.Major, Minor: registered.format.Minor,
+			Read: registered.read, Write: registered.write, TestOnly: registered.testOnly,
+			CryptographicSuite: cryptographicSuiteName, RequiredFeatures: []string{},
+		})
+	}
+	return capabilities
+}
+
+// DefaultWriter returns the newest exact registered writer.
+func (r *Registry) DefaultWriter() (Format, error) {
+	for index := len(r.formats) - 1; index >= 0; index-- {
+		if r.formats[index].write {
+			return r.formats[index].format, nil
+		}
+	}
+	return Format{}, errors.New("no Ciphertext Repository writer is registered")
+}
+
+// ParseFormat resolves a command target to one exact registered format.
+func (r *Registry) ParseFormat(value string) (Format, error) {
+	for _, registered := range r.formats {
+		if value == registered.format.String() || value == fmt.Sprintf("v%d.%d", registered.format.Major, registered.format.Minor) {
+			return registered.format, nil
+		}
+	}
+	return Format{}, fmt.Errorf("unsupported target repository format %q", value)
+}
+
+// RequireWriter selects only an explicitly registered writer.
+func (r *Registry) RequireWriter(format Format) error {
+	for _, registered := range r.formats {
+		if registered.format == format {
+			if registered.write {
+				return nil
+			}
+			if registered.read {
+				return ErrMigrationRequired
+			}
+		}
+	}
+	return fmt.Errorf("unsupported repository format %s", format)
+}
+
+func (r *Registry) withFormat(format Format) *Registry {
+	clone := *r
+	clone.active = format
+	return &clone
 }
 
 // EncodeEmpty creates a complete authenticated v1 snapshot with no Logical Refs.
@@ -346,40 +433,63 @@ func (r *Registry) manifestAssociatedData(repositoryID domain.RepositoryID, plai
 }
 
 func encodePreamble(headerLength int) ([]byte, error) {
+	return encodePreambleFor(V1, headerLength)
+}
+
+func encodePreambleFor(format Format, headerLength int) ([]byte, error) {
 	if headerLength <= 0 || headerLength > maximumHeaderSize {
 		return nil, fmt.Errorf("bootstrap header length %d exceeds limit", headerLength)
 	}
 	preamble := make([]byte, preambleSize)
 	copy(preamble, magic[:])
 	preamble[8] = BootstrapFraming
-	preamble[9] = FormatMajor
-	preamble[10] = FormatMinor
+	preamble[9] = byte(format.Major)
+	preamble[10] = byte(format.Minor)
 	preamble[11] = 0
 	binary.BigEndian.PutUint32(preamble[12:], uint32(headerLength))
 	return preamble, nil
 }
 
 func probePreamble(bootstrap []byte) ([]byte, error) {
+	return NewRegistry().probePreamble(bootstrap)
+}
+
+// Probe selects a supported exact reader using only the bounded public Bootstrap Preamble.
+func (r *Registry) Probe(bootstrap []byte) (Format, error) {
+	format, _, err := r.probe(bootstrap)
+	return format, err
+}
+
+func (r *Registry) probePreamble(bootstrap []byte) ([]byte, error) {
+	_, header, err := r.probe(bootstrap)
+	return header, err
+}
+
+func (r *Registry) probe(bootstrap []byte) (Format, []byte, error) {
 	if len(bootstrap) < preambleSize || !bytes.Equal(bootstrap[:8], magic[:]) {
-		return nil, errors.New("unknown bootstrap framing")
+		return Format{}, nil, errors.New("unknown bootstrap framing")
 	}
 	if bootstrap[8] != BootstrapFraming {
-		return nil, errors.New("unsupported bootstrap framing version")
-	}
-	if bootstrap[9] != FormatMajor {
-		return nil, errors.New("unsupported repository format major version")
-	}
-	if bootstrap[10] != FormatMinor {
-		return nil, errors.New("unsupported repository format minor version")
+		return Format{}, nil, errors.New("unsupported bootstrap framing version")
 	}
 	if bootstrap[11] != 0 {
-		return nil, errors.New("unknown required repository feature")
+		return Format{}, nil, errors.New("unknown required repository feature")
+	}
+	var format Format
+	for _, registered := range r.formats {
+		if registered.format.Major == uint64(bootstrap[9]) && registered.format.Minor == uint64(bootstrap[10]) && registered.read {
+			format = registered.format
+			break
+		}
+	}
+	if format == (Format{}) {
+		return Format{}, nil, errors.New("unsupported repository format major or minor version")
 	}
 	headerLength := int(binary.BigEndian.Uint32(bootstrap[12:16]))
 	if headerLength <= 0 || headerLength > maximumHeaderSize || len(bootstrap) != preambleSize+headerLength {
-		return nil, errors.New("invalid bounded bootstrap header length")
+		return Format{}, nil, errors.New("invalid bounded bootstrap header length")
 	}
-	return bootstrap[preambleSize:], nil
+	return format, bootstrap[preambleSize:], nil
 }
 
 func validateEmptyRepository(repository EmptyRepository) error {
@@ -396,13 +506,24 @@ func validateEmptyRepository(repository EmptyRepository) error {
 }
 
 func deriveKey(secret domain.RecoverySecret, repositoryID domain.RepositoryID, purpose keyPurpose) ([32]byte, error) {
-	info := []byte("git-remote-cloak/v1/aes-256-gcm-siv/" + string(purpose))
+	return deriveKeyFor(V1, secret, repositoryID, purpose)
+}
+
+func deriveKeyFor(format Format, secret domain.RecoverySecret, repositoryID domain.RepositoryID, purpose keyPurpose) ([32]byte, error) {
+	info := []byte(fmt.Sprintf("git-remote-cloak/%s/aes-256-gcm-siv/%s", format.cryptoDomain(), purpose))
 	reader := hkdf.New(sha256.New, secret[:], repositoryID[:], info)
 	var key [32]byte
 	if _, err := io.ReadFull(reader, key[:]); err != nil {
 		return [32]byte{}, fmt.Errorf("derive %s key: %w", purpose, err)
 	}
 	return key, nil
+}
+
+func (format Format) cryptoDomain() string {
+	if format == V1 {
+		return "v1"
+	}
+	return fmt.Sprintf("v%d.%d", format.Major, format.Minor)
 }
 
 func newAESGCMSIV(key [32]byte) (aeadPrimitive, error) {

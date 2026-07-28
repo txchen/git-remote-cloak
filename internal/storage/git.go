@@ -106,6 +106,9 @@ func (transport *Git) PublishPrepared(expectedStorageCommitID, commitID string) 
 			if os.Getenv("CLOAK_TEST_FAULT") == "after-storage-ref" {
 				return errors.New("injected lost response after Storage Ref publication")
 			}
+			if os.Getenv("CLOAK_TEST_FAULT") == "lost-process-after-storage-ref" {
+				os.Exit(87)
+			}
 			return nil
 		} else {
 			lastError = err

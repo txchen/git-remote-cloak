@@ -23,6 +23,7 @@ const (
 
 // SnapshotState is the authenticated Logical Repository metadata carried by one Ciphertext Snapshot.
 type SnapshotState struct {
+	Format               Format
 	RepositoryID         domain.RepositoryID
 	Generation           uint64
 	LogicalHEAD          domain.LogicalHEAD
@@ -31,6 +32,14 @@ type SnapshotState struct {
 	PreviousStorageRef   string
 	CompactedSize        uint64
 	AddedSinceCompaction uint64
+	MigrationSource      *MigrationSource
+}
+
+// MigrationSource authenticates the Ciphertext Snapshot replaced by Format Migration.
+type MigrationSource struct {
+	Format     Format
+	Generation uint64
+	StorageRef string
 }
 
 // PackPayload is a self-contained native Git pack and its independently known object set.
@@ -89,6 +98,14 @@ type snapshotManifest struct {
 	RequiredFeatures     []uint64                  `cbor:"6,keyasint"`
 	CompactedSize        uint64                    `cbor:"7,keyasint,omitempty"`
 	AddedSinceCompaction uint64                    `cbor:"8,keyasint,omitempty"`
+	MigrationSource      *snapshotMigrationSource  `cbor:"9,keyasint,omitempty"`
+}
+
+type snapshotMigrationSource struct {
+	FormatMajor uint64 `cbor:"1,keyasint"`
+	FormatMinor uint64 `cbor:"2,keyasint"`
+	Generation  uint64 `cbor:"3,keyasint"`
+	StorageRef  string `cbor:"4,keyasint"`
 }
 
 type snapshotPayloadLocation struct {
@@ -130,6 +147,24 @@ type encryptedRecord struct {
 
 // EncodeSnapshot maps one complete non-empty Logical Repository into a Ciphertext Snapshot.
 func (r *Registry) EncodeSnapshot(secret domain.RecoverySecret, input SnapshotInput) (EncodedSnapshot, error) {
+	format := input.Repository.Format
+	if format == (Format{}) {
+		format = V1
+	}
+	return r.EncodeSnapshotAs(secret, format, input)
+}
+
+// EncodeSnapshotAs encodes using one exact registered writer.
+func (r *Registry) EncodeSnapshotAs(secret domain.RecoverySecret, format Format, input SnapshotInput) (EncodedSnapshot, error) {
+	if err := r.RequireWriter(format); err != nil {
+		return EncodedSnapshot{}, err
+	}
+	codec := r.withFormat(format)
+	input.Repository.Format = format
+	return codec.encodeSnapshot(secret, input)
+}
+
+func (r *Registry) encodeSnapshot(secret domain.RecoverySecret, input SnapshotInput) (EncodedSnapshot, error) {
 	repository := input.Repository
 	if err := validateSnapshotRepository(repository); err != nil {
 		return EncodedSnapshot{}, err
@@ -164,11 +199,19 @@ func (r *Registry) EncodeSnapshot(secret domain.RecoverySecret, input SnapshotIn
 		}
 		logicalRefs[name] = decoded
 	}
+	var migrationSource *snapshotMigrationSource
+	if repository.MigrationSource != nil {
+		migrationSource = &snapshotMigrationSource{
+			FormatMajor: repository.MigrationSource.Format.Major, FormatMinor: repository.MigrationSource.Format.Minor,
+			Generation: repository.MigrationSource.Generation, StorageRef: repository.MigrationSource.StorageRef,
+		}
+	}
 	manifestPlaintext, err := r.encode.Marshal(snapshotManifest{
 		Generation: repository.Generation, ObjectFormat: repository.ObjectFormat,
 		LogicalHEAD: string(repository.LogicalHEAD), LogicalRefs: logicalRefs,
 		PackPayloads: payloadLocations, RequiredFeatures: []uint64{},
 		CompactedSize: repository.CompactedSize, AddedSinceCompaction: repository.AddedSinceCompaction,
+		MigrationSource: migrationSource,
 	})
 	if err != nil {
 		return EncodedSnapshot{}, fmt.Errorf("encode Encrypted Manifest: %w", err)
@@ -253,7 +296,7 @@ func (r *Registry) encodePackPayload(secret domain.RecoverySecret, repository Sn
 
 func (r *Registry) encodeSnapshotBootstrap(secret domain.RecoverySecret, repository SnapshotState, manifestLocator string) ([]byte, error) {
 	unsigned := snapshotUnsignedHeader{
-		RepositoryID: repository.RepositoryID[:], FormatMajor: FormatMajor, FormatMinor: FormatMinor,
+		RepositoryID: repository.RepositoryID[:], FormatMajor: r.active.Major, FormatMinor: r.active.Minor,
 		CryptographicSuite: CryptographicSuite, ChunkSize: DefaultChunkSize, Generation: repository.Generation,
 		ManifestLocator: manifestLocator, PreviousStorageRef: repository.PreviousStorageRef,
 	}
@@ -270,11 +313,11 @@ func (r *Registry) encodeSnapshotBootstrap(secret domain.RecoverySecret, reposit
 	if err != nil {
 		return nil, err
 	}
-	preamble, err := encodePreamble(len(headerBytes))
+	preamble, err := encodePreambleFor(r.active, len(headerBytes))
 	if err != nil {
 		return nil, err
 	}
-	key, err := deriveKey(secret, repository.RepositoryID, headerAuthenticationPurpose)
+	key, err := deriveKeyFor(r.active, secret, repository.RepositoryID, headerAuthenticationPurpose)
 	if err != nil {
 		return nil, err
 	}
@@ -302,10 +345,14 @@ func (r *Registry) DecodeSnapshot(secret domain.RecoverySecret, bootstrap []byte
 
 // DecodeSnapshotFrom authenticates the Bootstrap Header before resolving referenced ciphertext objects.
 func (r *Registry) DecodeSnapshotFrom(secret domain.RecoverySecret, bootstrap []byte, resolve func(string) ([]byte, error)) (DecodedSnapshot, error) {
-	headerBytes, err := probePreamble(bootstrap)
+	format, headerBytes, err := r.probe(bootstrap)
 	if err != nil {
 		return DecodedSnapshot{}, err
 	}
+	return r.withFormat(format).decodeSnapshotFrom(secret, bootstrap, headerBytes, resolve)
+}
+
+func (r *Registry) decodeSnapshotFrom(secret domain.RecoverySecret, bootstrap, headerBytes []byte, resolve func(string) ([]byte, error)) (DecodedSnapshot, error) {
 	var header snapshotBootstrapHeader
 	if err := r.decode.Unmarshal(headerBytes, &header); err != nil {
 		return DecodedSnapshot{}, fmt.Errorf("decode Bootstrap Header: %w", err)
@@ -314,7 +361,7 @@ func (r *Registry) DecodeSnapshotFrom(secret domain.RecoverySecret, bootstrap []
 	if err != nil || !bytes.Equal(canonical, headerBytes) {
 		return DecodedSnapshot{}, errors.New("Bootstrap Header is not canonical CBOR")
 	}
-	if len(header.RepositoryID) != 16 || header.Generation < 1 || header.FormatMajor != FormatMajor || header.FormatMinor != FormatMinor || header.CryptographicSuite != CryptographicSuite || header.ChunkSize != DefaultChunkSize {
+	if len(header.RepositoryID) != 16 || header.Generation < 1 || header.FormatMajor != r.active.Major || header.FormatMinor != r.active.Minor || header.CryptographicSuite != CryptographicSuite || header.ChunkSize != DefaultChunkSize {
 		return DecodedSnapshot{}, errors.New("Bootstrap Header disagrees with supported v1 format")
 	}
 	var repositoryID domain.RepositoryID
@@ -327,7 +374,7 @@ func (r *Registry) DecodeSnapshotFrom(secret domain.RecoverySecret, bootstrap []
 	if err != nil {
 		return DecodedSnapshot{}, err
 	}
-	key, err := deriveKey(secret, repositoryID, headerAuthenticationPurpose)
+	key, err := deriveKeyFor(r.active, secret, repositoryID, headerAuthenticationPurpose)
 	if err != nil {
 		return DecodedSnapshot{}, err
 	}
@@ -344,7 +391,7 @@ func (r *Registry) DecodeSnapshotFrom(secret domain.RecoverySecret, bootstrap []
 	if len(manifestCiphertext) < 28 || len(manifestCiphertext)-28 > maximumManifestSize {
 		return DecodedSnapshot{}, errors.New("Encrypted Manifest exceeds the v1 size limit")
 	}
-	repository := SnapshotState{RepositoryID: repositoryID, Generation: header.Generation, PreviousStorageRef: header.PreviousStorageRef}
+	repository := SnapshotState{Format: r.active, RepositoryID: repositoryID, Generation: header.Generation, PreviousStorageRef: header.PreviousStorageRef}
 	manifestPlaintext, err := r.decryptRecord(secret, repository, encryptedRecord{
 		generation: repository.Generation, purpose: manifestEncryptionPurpose, kind: manifestKind, final: true,
 	}, manifestCiphertext)
@@ -363,6 +410,13 @@ func (r *Registry) DecodeSnapshotFrom(secret domain.RecoverySecret, bootstrap []
 	repository.LogicalRefs = make(map[string]string, len(manifest.LogicalRefs))
 	repository.CompactedSize = manifest.CompactedSize
 	repository.AddedSinceCompaction = manifest.AddedSinceCompaction
+	if manifest.MigrationSource != nil {
+		sourceFormat, found := r.knownFormat(manifest.MigrationSource.FormatMajor, manifest.MigrationSource.FormatMinor)
+		if !found || manifest.MigrationSource.Generation < 1 || !validStorageRef(manifest.MigrationSource.StorageRef) {
+			return DecodedSnapshot{}, errors.New("invalid authenticated Migration source metadata")
+		}
+		repository.MigrationSource = &MigrationSource{Format: sourceFormat, Generation: manifest.MigrationSource.Generation, StorageRef: manifest.MigrationSource.StorageRef}
+	}
 	for name, objectID := range manifest.LogicalRefs {
 		repository.LogicalRefs[name] = hex.EncodeToString(objectID)
 	}
@@ -462,7 +516,7 @@ func (r *Registry) decodePackPayload(secret domain.RecoverySecret, repository Sn
 }
 
 func (r *Registry) encryptRecord(secret domain.RecoverySecret, repository SnapshotState, record encryptedRecord, plaintext []byte) ([]byte, error) {
-	key, err := derivePayloadKey(secret, repository.RepositoryID, record.purpose, record.payloadIdentity)
+	key, err := derivePayloadKeyFor(r.active, secret, repository.RepositoryID, record.purpose, record.payloadIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -510,7 +564,7 @@ func (r *Registry) decryptRecord(secret domain.RecoverySecret, repository Snapsh
 		return nil, errors.New("encrypted record is truncated")
 	}
 	plaintextLength := len(ciphertext) - 28
-	key, err := derivePayloadKey(secret, repository.RepositoryID, record.purpose, record.payloadIdentity)
+	key, err := derivePayloadKeyFor(r.active, secret, repository.RepositoryID, record.purpose, record.payloadIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -527,23 +581,44 @@ func (r *Registry) decryptRecord(secret domain.RecoverySecret, repository Snapsh
 
 func (r *Registry) snapshotAssociatedData(repository SnapshotState, record encryptedRecord, plaintextLength int) ([]byte, error) {
 	return r.encode.Marshal(snapshotRecordContext{
-		Protocol: "git-remote-cloak", FormatMajor: FormatMajor, FormatMinor: FormatMinor, Suite: CryptographicSuite,
+		Protocol: "git-remote-cloak", FormatMajor: r.active.Major, FormatMinor: r.active.Minor, Suite: CryptographicSuite,
 		RepositoryID: repository.RepositoryID[:], RecordKind: record.kind, Generation: record.generation,
 		Final: record.final, PlaintextLen: uint64(plaintextLength), PayloadIdentity: record.payloadIdentity, ChunkIndex: record.chunkIndex,
 	})
 }
 
 func derivePayloadKey(secret domain.RecoverySecret, repositoryID domain.RepositoryID, purpose keyPurpose, payloadIdentity []byte) ([32]byte, error) {
+	return derivePayloadKeyFor(V1, secret, repositoryID, purpose, payloadIdentity)
+}
+
+func derivePayloadKeyFor(format Format, secret domain.RecoverySecret, repositoryID domain.RepositoryID, purpose keyPurpose, payloadIdentity []byte) ([32]byte, error) {
 	if len(payloadIdentity) == 0 {
-		return deriveKey(secret, repositoryID, purpose)
+		return deriveKeyFor(format, secret, repositoryID, purpose)
 	}
-	info := []byte("git-remote-cloak/v1/aes-256-gcm-siv/" + string(purpose) + "/" + hex.EncodeToString(payloadIdentity))
+	info := []byte(fmt.Sprintf("git-remote-cloak/%s/aes-256-gcm-siv/%s/%s", format.cryptoDomain(), purpose, hex.EncodeToString(payloadIdentity)))
 	reader := hkdf.New(sha256.New, secret[:], repositoryID[:], info)
 	var key [32]byte
 	if _, err := io.ReadFull(reader, key[:]); err != nil {
 		return [32]byte{}, err
 	}
 	return key, nil
+}
+
+func (r *Registry) knownFormat(major, minor uint64) (Format, bool) {
+	for _, registered := range r.formats {
+		if registered.format.Major == major && registered.format.Minor == minor {
+			return registered.format, true
+		}
+	}
+	return Format{}, false
+}
+
+func validStorageRef(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil && value == strings.ToLower(value)
 }
 
 func (r *Registry) decodeCanonical(data []byte, target any, name string) error {

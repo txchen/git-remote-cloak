@@ -3,6 +3,7 @@ package format_test
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"os"
 	"regexp"
 	"strings"
@@ -228,6 +229,94 @@ func TestRegistryFailsClosedForUnsupportedPreamble(t *testing.T) {
 				t.Fatal("DecodeEmpty succeeded, want fail-closed error")
 			}
 		})
+	}
+}
+
+func TestRegistrySelectsExactReadersAndWriters(t *testing.T) {
+	registry := cloakformat.NewRegistryForTesting()
+	capabilities := registry.Capabilities()
+	if len(capabilities) != 2 {
+		t.Fatalf("test registry capability count = %d, want 2", len(capabilities))
+	}
+	if capabilities[0].Format != "v1.0" || !capabilities[0].Read || !capabilities[0].Write {
+		t.Fatalf("v1 capability = %+v, want exact read/write support", capabilities[0])
+	}
+	if capabilities[1].Format != "test-v2.0" || !capabilities[1].Read || !capabilities[1].Write || !capabilities[1].TestOnly {
+		t.Fatalf("test format capability = %+v, want exact test-only read/write support", capabilities[1])
+	}
+	production := cloakformat.NewRegistry().Capabilities()
+	if len(production) != 1 || production[0].TestOnly {
+		t.Fatalf("production capabilities advertised test format: %+v", production)
+	}
+
+	readOnly := cloakformat.NewReadOnlyRegistryForTesting()
+	if err := readOnly.RequireWriter(cloakformat.V1); !errors.Is(err, cloakformat.ErrMigrationRequired) {
+		t.Fatalf("read-only writer selection error = %v, want ErrMigrationRequired", err)
+	}
+}
+
+func TestRegistryTestFormatRoundTripsWithFormatSpecificKeys(t *testing.T) {
+	registry := cloakformat.NewRegistryForTesting()
+	input := cloakformat.SnapshotInput{
+		Repository: cloakformat.SnapshotState{
+			RepositoryID: testRepositoryID, Generation: 2, LogicalHEAD: "refs/heads/main",
+			ObjectFormat: "sha1", PreviousStorageRef: strings.Repeat("a", 40),
+			LogicalRefs: map[string]string{"refs/heads/main": strings.Repeat("1", 40)},
+			MigrationSource: &cloakformat.MigrationSource{
+				Format: cloakformat.V1, Generation: 1, StorageRef: strings.Repeat("a", 40),
+			},
+		},
+		Packs: []cloakformat.PackPayload{{Pack: []byte("PACK-test-format"), ObjectIDs: []string{strings.Repeat("1", 40)}}},
+	}
+	encoded, err := registry.EncodeSnapshotAs(testSecret, cloakformat.TestV2, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := registry.Probe(encoded.Bootstrap); err != nil || got != cloakformat.TestV2 {
+		t.Fatalf("Probe(test snapshot) = %v, %v", got, err)
+	}
+	resolved := 0
+	decoded, err := registry.DecodeSnapshotFrom(testSecret, encoded.Bootstrap, func(locator string) ([]byte, error) {
+		resolved++
+		return encoded.CiphertextObjects[locator], nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Repository.Format != cloakformat.TestV2 || decoded.Repository.MigrationSource == nil || decoded.Repository.MigrationSource.Format != cloakformat.V1 {
+		t.Fatalf("decoded format metadata = %+v", decoded.Repository)
+	}
+	if resolved == 0 {
+		t.Fatal("test snapshot did not resolve encrypted payloads")
+	}
+
+	production := cloakformat.NewRegistry()
+	resolved = 0
+	_, err = production.DecodeSnapshotFrom(testSecret, encoded.Bootstrap, func(string) ([]byte, error) {
+		resolved++
+		return nil, errors.New("must not resolve")
+	})
+	if err == nil || resolved != 0 {
+		t.Fatalf("unsupported format error = %v, payload resolutions = %d; want fail closed before payload processing", err, resolved)
+	}
+}
+
+func TestMigrationSourceStorageRefIsIndependentOfLogicalObjectFormat(t *testing.T) {
+	registry := cloakformat.NewRegistryForTesting()
+	input := cloakformat.SnapshotInput{
+		Repository: cloakformat.SnapshotState{
+			RepositoryID: testRepositoryID, Generation: 2, LogicalHEAD: "refs/heads/main", ObjectFormat: "sha256",
+			PreviousStorageRef: strings.Repeat("a", 40), LogicalRefs: map[string]string{"refs/heads/main": strings.Repeat("1", 64)},
+			MigrationSource: &cloakformat.MigrationSource{Format: cloakformat.V1, Generation: 1, StorageRef: strings.Repeat("a", 40)},
+		},
+		Packs: []cloakformat.PackPayload{{Pack: []byte("PACK-sha256"), ObjectIDs: []string{strings.Repeat("1", 64)}}},
+	}
+	encoded, err := registry.EncodeSnapshotAs(testSecret, cloakformat.TestV2, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.DecodeSnapshot(testSecret, encoded.Bootstrap, encoded.CiphertextObjects); err != nil {
+		t.Fatalf("decode SHA-256 Logical Repository with SHA-1 Storage Ref: %v", err)
 	}
 }
 

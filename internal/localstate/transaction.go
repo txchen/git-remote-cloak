@@ -24,6 +24,13 @@ type MaintenanceOperation string
 // CompactionOperation identifies Snapshot Rebuild publication journals.
 const CompactionOperation MaintenanceOperation = "compaction"
 
+// MigrationOperation identifies Format Migration publication journals.
+const MigrationOperation MaintenanceOperation = "migration"
+
+func (operation MaintenanceOperation) isSupported() bool {
+	return operation == "" || operation == CompactionOperation || operation == MigrationOperation
+}
+
 // Transaction records only an opaque authenticated intent and public Storage
 // History identities. It contains no Recovery Secret, derived key, Logical Ref
 // name, or plaintext Git object identity.
@@ -79,7 +86,8 @@ func StoreTransaction(gitDirectory string, transaction Transaction, secret domai
 		return errors.New("injected local journal write failure")
 	}
 	transaction.Version = transactionVersion
-	if !validHexID(transaction.IntentID) || !validGitObjectID(transaction.StartingStorageCommitID) || !validGitObjectID(transaction.PreparedStorageCommitID) || transaction.Operation != "" && transaction.Operation != CompactionOperation {
+	if !validHexID(transaction.IntentID) || !validGitObjectID(transaction.StartingStorageCommitID) ||
+		!validGitObjectID(transaction.PreparedStorageCommitID) || !transaction.Operation.isSupported() {
 		return errors.New("invalid crash journal state")
 	}
 	authenticationTag, err := transactionAuthentication(transaction, secret, repositoryID)
