@@ -195,6 +195,16 @@ func (transport *LocalBare) PublishSnapshot(expectedStorageCommitID string, boot
 // PrepareSnapshot uploads immutable ciphertext and builds a Storage commit
 // without changing the authoritative Storage Ref.
 func (transport *LocalBare) PrepareSnapshot(expectedStorageCommitID string, bootstrap []byte, ciphertextObjects map[string][]byte) (string, error) {
+	return transport.prepareSnapshot(expectedStorageCommitID, bootstrap, ciphertextObjects, true)
+}
+
+// PrepareRootSnapshot uploads immutable ciphertext and builds a parentless
+// Storage History root without changing the authoritative Storage Ref.
+func (transport *LocalBare) PrepareRootSnapshot(expectedStorageCommitID string, bootstrap []byte, ciphertextObjects map[string][]byte) (string, error) {
+	return transport.prepareSnapshot(expectedStorageCommitID, bootstrap, ciphertextObjects, false)
+}
+
+func (transport *LocalBare) prepareSnapshot(expectedStorageCommitID string, bootstrap []byte, ciphertextObjects map[string][]byte, retainParent bool) (string, error) {
 	if len(ciphertextObjects) == 0 {
 		return "", errors.New("Ciphertext Snapshot contains no encrypted objects")
 	}
@@ -228,7 +238,7 @@ func (transport *LocalBare) PrepareSnapshot(expectedStorageCommitID string, boot
 		return "", fmt.Errorf("build Ciphertext Snapshot tree: %w", err)
 	}
 	commitArguments := []string{"commit-tree", strings.TrimSpace(string(rootTree))}
-	if expectedStorageCommitID != transport.zeroObject {
+	if retainParent && expectedStorageCommitID != transport.zeroObject {
 		commitArguments = append(commitArguments, "-p", expectedStorageCommitID)
 	}
 	commit, err := runGit(transport.path, []byte("cloak snapshot\n"), commitArguments...)

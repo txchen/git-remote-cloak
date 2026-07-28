@@ -58,10 +58,11 @@ type EmptyRepository struct {
 
 // EncodedSnapshot contains a Bootstrap Header and Encrypted Manifest.
 type EncodedSnapshot struct {
-	Bootstrap         []byte
-	Manifest          []byte
-	ManifestLocator   string
-	CiphertextObjects map[string][]byte
+	Bootstrap           []byte
+	Manifest            []byte
+	ManifestLocator     string
+	CiphertextObjects   map[string][]byte
+	PackCiphertextSizes []uint64
 }
 
 // Capability reports one exact Ciphertext Repository reader and writer.

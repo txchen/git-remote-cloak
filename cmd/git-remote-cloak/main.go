@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -43,16 +44,78 @@ func run(arguments []string) error {
 		return runStatus(arguments[1:])
 	case "set-head":
 		return runSetHead(arguments[1:])
+	case "compact":
+		return runCompact(arguments[1:])
 	default:
 		if len(arguments) == 2 {
 			recoverySecret, err := acquireSecret("", false)
 			if err != nil {
 				return err
 			}
-			return remotehelper.Run(arguments[1], recoverySecret, os.Stdin, os.Stdout)
+			autoCompact, err := remoteAutoCompact(arguments[0])
+			if err != nil {
+				return err
+			}
+			return remotehelper.RunWithOptions(arguments[1], recoverySecret, os.Stdin, os.Stdout, engine.PublishOptions{
+				AutoCompact: autoCompact,
+				Progress:    func(message string) { fmt.Fprintln(os.Stderr, message) },
+			})
 		}
 		return usageError()
 	}
+}
+
+func remoteAutoCompact(remoteName string) (bool, error) {
+	command := exec.Command("git", "config", "--bool", "--get", "remote."+remoteName+".cloakAutoCompact")
+	output, err := command.Output()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok && exitError.ExitCode() == 1 {
+			return true, nil
+		}
+		return false, fmt.Errorf("read automatic Compaction configuration: %w", err)
+	}
+	switch strings.TrimSpace(string(output)) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, errors.New("remote.<name>.cloakAutoCompact must be true or false")
+	}
+}
+
+func runCompact(arguments []string) error {
+	if len(arguments) != 1 {
+		return fmt.Errorf("usage: git-remote-cloak compact <remote-name>")
+	}
+	recoverySecret, err := acquireSecret("", false)
+	if err != nil {
+		return err
+	}
+	workspace, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	configuredURL, err := exec.Command("git", "-C", workspace, "remote", "get-url", arguments[0]).Output()
+	if err != nil {
+		return fmt.Errorf("read Cloak remote %s", arguments[0])
+	}
+	repositoryURL, found := strings.CutPrefix(strings.TrimSpace(string(configuredURL)), "cloak::")
+	if !found || repositoryURL == "" {
+		return fmt.Errorf("configured remote is not a Cloak remote")
+	}
+	gitDirectory, err := absoluteGitDirectory()
+	if err != nil {
+		return err
+	}
+	if err := engine.NewWithLocalState(gitDirectory).Compact(repositoryURL, recoverySecret, func(phase string) {
+		fmt.Printf("%s Compaction candidate.\n", phase)
+	}); err != nil {
+		return err
+	}
+	fmt.Println("Compaction published a validated optimized Ciphertext Snapshot and a parentless Storage History root.")
+	fmt.Println("Warning: Repository Host retention and garbage collection may delay quota recovery or physical erasure of superseded ciphertext.")
+	return nil
 }
 
 func runCache(arguments []string) error {

@@ -23,12 +23,14 @@ const (
 
 // SnapshotState is the authenticated Logical Repository metadata carried by one Ciphertext Snapshot.
 type SnapshotState struct {
-	RepositoryID       domain.RepositoryID
-	Generation         uint64
-	LogicalHEAD        domain.LogicalHEAD
-	ObjectFormat       string
-	LogicalRefs        map[string]string
-	PreviousStorageRef string
+	RepositoryID         domain.RepositoryID
+	Generation           uint64
+	LogicalHEAD          domain.LogicalHEAD
+	ObjectFormat         string
+	LogicalRefs          map[string]string
+	PreviousStorageRef   string
+	CompactedSize        uint64
+	AddedSinceCompaction uint64
 }
 
 // PackPayload is a self-contained native Git pack and its independently known object set.
@@ -79,12 +81,14 @@ type snapshotUnsignedHeader struct {
 }
 
 type snapshotManifest struct {
-	Generation       uint64                    `cbor:"1,keyasint"`
-	ObjectFormat     string                    `cbor:"2,keyasint"`
-	LogicalHEAD      string                    `cbor:"3,keyasint"`
-	LogicalRefs      map[string][]byte         `cbor:"4,keyasint"`
-	PackPayloads     []snapshotPayloadLocation `cbor:"5,keyasint"`
-	RequiredFeatures []uint64                  `cbor:"6,keyasint"`
+	Generation           uint64                    `cbor:"1,keyasint"`
+	ObjectFormat         string                    `cbor:"2,keyasint"`
+	LogicalHEAD          string                    `cbor:"3,keyasint"`
+	LogicalRefs          map[string][]byte         `cbor:"4,keyasint"`
+	PackPayloads         []snapshotPayloadLocation `cbor:"5,keyasint"`
+	RequiredFeatures     []uint64                  `cbor:"6,keyasint"`
+	CompactedSize        uint64                    `cbor:"7,keyasint,omitempty"`
+	AddedSinceCompaction uint64                    `cbor:"8,keyasint,omitempty"`
 }
 
 type snapshotPayloadLocation struct {
@@ -138,15 +142,19 @@ func (r *Registry) EncodeSnapshot(secret domain.RecoverySecret, input SnapshotIn
 	}
 	objects := make(map[string][]byte)
 	payloadLocations := make([]snapshotPayloadLocation, 0, len(input.Packs))
+	packCiphertextSizes := make([]uint64, 0, len(input.Packs))
 	for _, payload := range input.Packs {
 		location, encryptedObjects, err := r.encodePackPayload(secret, repository, payload)
 		if err != nil {
 			return EncodedSnapshot{}, err
 		}
 		payloadLocations = append(payloadLocations, location)
+		var payloadSize uint64
 		for locator, ciphertext := range encryptedObjects {
 			objects[locator] = ciphertext
+			payloadSize += uint64(len(ciphertext))
 		}
+		packCiphertextSizes = append(packCiphertextSizes, payloadSize)
 	}
 	logicalRefs := make(map[string][]byte, len(repository.LogicalRefs))
 	for name, objectID := range repository.LogicalRefs {
@@ -160,6 +168,7 @@ func (r *Registry) EncodeSnapshot(secret domain.RecoverySecret, input SnapshotIn
 		Generation: repository.Generation, ObjectFormat: repository.ObjectFormat,
 		LogicalHEAD: string(repository.LogicalHEAD), LogicalRefs: logicalRefs,
 		PackPayloads: payloadLocations, RequiredFeatures: []uint64{},
+		CompactedSize: repository.CompactedSize, AddedSinceCompaction: repository.AddedSinceCompaction,
 	})
 	if err != nil {
 		return EncodedSnapshot{}, fmt.Errorf("encode Encrypted Manifest: %w", err)
@@ -176,7 +185,7 @@ func (r *Registry) EncodeSnapshot(secret domain.RecoverySecret, input SnapshotIn
 	if err != nil {
 		return EncodedSnapshot{}, err
 	}
-	return EncodedSnapshot{Bootstrap: bootstrap, Manifest: manifest, ManifestLocator: manifestLocator, CiphertextObjects: objects}, nil
+	return EncodedSnapshot{Bootstrap: bootstrap, Manifest: manifest, ManifestLocator: manifestLocator, CiphertextObjects: objects, PackCiphertextSizes: packCiphertextSizes}, nil
 }
 
 func (r *Registry) encodePackPayload(secret domain.RecoverySecret, repository SnapshotState, payload PackPayload) (snapshotPayloadLocation, map[string][]byte, error) {
@@ -352,6 +361,8 @@ func (r *Registry) DecodeSnapshotFrom(secret domain.RecoverySecret, bootstrap []
 	repository.LogicalHEAD = domain.LogicalHEAD(manifest.LogicalHEAD)
 	repository.ObjectFormat = manifest.ObjectFormat
 	repository.LogicalRefs = make(map[string]string, len(manifest.LogicalRefs))
+	repository.CompactedSize = manifest.CompactedSize
+	repository.AddedSinceCompaction = manifest.AddedSinceCompaction
 	for name, objectID := range manifest.LogicalRefs {
 		repository.LogicalRefs[name] = hex.EncodeToString(objectID)
 	}

@@ -18,15 +18,22 @@ import (
 
 const transactionVersion = 1
 
+// MaintenanceOperation names an authenticated crash-journal workflow.
+type MaintenanceOperation string
+
+// CompactionOperation identifies Snapshot Rebuild publication journals.
+const CompactionOperation MaintenanceOperation = "compaction"
+
 // Transaction records only an opaque authenticated intent and public Storage
 // History identities. It contains no Recovery Secret, derived key, Logical Ref
 // name, or plaintext Git object identity.
 type Transaction struct {
-	Version                 int    `json:"version"`
-	IntentID                string `json:"intent_id"`
-	StartingStorageCommitID string `json:"starting_storage_commit_id"`
-	PreparedStorageCommitID string `json:"prepared_storage_commit_id"`
-	AuthenticationTag       string `json:"authentication_tag"`
+	Version                 int                  `json:"version"`
+	IntentID                string               `json:"intent_id"`
+	StartingStorageCommitID string               `json:"starting_storage_commit_id"`
+	PreparedStorageCommitID string               `json:"prepared_storage_commit_id"`
+	AuthenticationTag       string               `json:"authentication_tag"`
+	Operation               MaintenanceOperation `json:"operation,omitempty"`
 }
 
 // TransactionIntentID authenticates a canonical logical transaction without
@@ -72,7 +79,7 @@ func StoreTransaction(gitDirectory string, transaction Transaction, secret domai
 		return errors.New("injected local journal write failure")
 	}
 	transaction.Version = transactionVersion
-	if !validHexID(transaction.IntentID) || !validGitObjectID(transaction.StartingStorageCommitID) || !validGitObjectID(transaction.PreparedStorageCommitID) {
+	if !validHexID(transaction.IntentID) || !validGitObjectID(transaction.StartingStorageCommitID) || !validGitObjectID(transaction.PreparedStorageCommitID) || transaction.Operation != "" && transaction.Operation != CompactionOperation {
 		return errors.New("invalid crash journal state")
 	}
 	authenticationTag, err := transactionAuthentication(transaction, secret, repositoryID)
@@ -119,10 +126,36 @@ func ReconcileTransactions(gitDirectory string, secret domain.RecoverySecret, re
 		intentID := strings.TrimSuffix(entry.Name(), ".json")
 		transaction, valid := LoadTransaction(gitDirectory, intentID, secret, repositoryID)
 		published := valid && (transaction.PreparedStorageCommitID == currentStorageCommitID || storageHistoryContains != nil && storageHistoryContains(transaction.PreparedStorageCommitID))
-		if !valid || published {
+		if !valid || published && transaction.Operation != CompactionOperation {
 			_ = os.Remove(filepath.Join(directory, entry.Name()))
 		}
 	}
+}
+
+// ConsumePublishedTransaction recognizes and removes one authenticated
+// operation whose prepared commit is now authoritative.
+func ConsumePublishedTransaction(gitDirectory string, secret domain.RecoverySecret, repositoryID domain.RepositoryID, currentStorageCommitID string, operation MaintenanceOperation, storageHistoryContains func(string) bool) bool {
+	if gitDirectory == "" {
+		return false
+	}
+	directory := filepath.Join(gitDirectory, "cloak", "transactions")
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		intentID := strings.TrimSuffix(entry.Name(), ".json")
+		transaction, valid := LoadTransaction(gitDirectory, intentID, secret, repositoryID)
+		published := valid && (transaction.PreparedStorageCommitID == currentStorageCommitID || storageHistoryContains != nil && storageHistoryContains(transaction.PreparedStorageCommitID))
+		if published && transaction.Operation == operation {
+			_ = RemoveTransaction(gitDirectory, intentID)
+			return true
+		}
+	}
+	return false
 }
 
 func journalKey(secret domain.RecoverySecret, repositoryID domain.RepositoryID, purpose string) ([32]byte, error) {
@@ -142,6 +175,9 @@ func transactionAuthentication(transaction Transaction, secret domain.RecoverySe
 	}
 	mac := hmac.New(sha256.New, key[:])
 	fmt.Fprintf(mac, "%d\x00%s\x00%s\x00%s", transaction.Version, transaction.IntentID, transaction.StartingStorageCommitID, transaction.PreparedStorageCommitID)
+	if transaction.Operation != "" {
+		fmt.Fprintf(mac, "\x00%s", transaction.Operation)
+	}
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 

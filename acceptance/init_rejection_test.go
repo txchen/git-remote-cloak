@@ -153,6 +153,9 @@ func mustInit(t *testing.T, binary, workspace, host, mnemonic string) {
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("init failed: %v\n%s", err, output)
 	}
+	// Most acceptance fixtures exercise non-maintenance behavior and keep
+	// Storage History linear. Compaction tests explicitly enable the default.
+	mustGit(t, workspace, "config", "remote.backup.cloakAutoCompact", "false")
 }
 
 func rejectedInit(t *testing.T, binary, workspace, host, mnemonic string) string {

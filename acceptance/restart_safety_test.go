@@ -149,6 +149,7 @@ func TestPushJournalRecoversBeforeAndAfterStorageRefPublication(t *testing.T) {
 	assertFilesExclude(t, transactions, testMnemonic, "lost response protected contents", "lost response protected commit", "lost-response.txt", "refs/heads/main")
 	compatibleWriter := filepath.Join(root, "compatible-writer")
 	mustCloakGit(t, binary, root, "clone", "cloak::"+host, compatibleWriter)
+	mustGit(t, compatibleWriter, "config", "remote.origin.cloakAutoCompact", "false")
 	mustGit(t, compatibleWriter, "switch", "-c", "topic")
 	writeAndCommit(t, compatibleWriter, "topic.txt", "compatible writer\n", "compatible writer commit")
 	mustCloakGit(t, binary, compatibleWriter, "push", "origin", "topic")

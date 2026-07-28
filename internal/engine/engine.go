@@ -26,6 +26,17 @@ type Engine struct {
 	localGitDirectory string
 }
 
+// ProgressFunc reports one safe maintenance phase name.
+type ProgressFunc func(string)
+
+// PublishOptions controls synchronous maintenance at the publication seam.
+type PublishOptions struct {
+	AutoCompact bool
+	Progress    ProgressFunc
+}
+
+func defaultPublishOptions() PublishOptions { return PublishOptions{AutoCompact: true} }
+
 // New returns a production Repository Engine.
 func New() *Engine { return &Engine{formats: cloakformat.NewRegistry()} }
 
@@ -319,10 +330,151 @@ func (engine *Engine) Publish(repositoryURL, logicalGitDirectory string, secret 
 	if err != nil {
 		return err
 	}
-	return engine.publishCurrent(transport, current, storageCommitID, logicalGitDirectory, secret)
+	return engine.publishCurrent(transport, current, storageCommitID, logicalGitDirectory, secret, defaultPublishOptions())
 }
 
-func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat.DecodedSnapshot, storageCommitID, logicalGitDirectory string, secret domain.RecoverySecret) error {
+// Compact rebuilds the current Logical Repository into one validated Pack
+// Payload and compare-and-swap publishes a parentless Storage History root.
+func (engine *Engine) Compact(repositoryURL string, secret domain.RecoverySecret, progress ProgressFunc) error {
+	operationLock, err := localstate.AcquireOperationLock(engine.localGitDirectory)
+	if err != nil {
+		return err
+	}
+	defer operationLock.Close()
+	transport, err := storage.OpenGit(repositoryURL)
+	if err != nil {
+		return err
+	}
+	defer transport.Close()
+	current, storageCommitID, err := engine.decodeTransportSnapshot(secret, transport)
+	if err != nil {
+		return err
+	}
+	if localstate.ConsumePublishedTransaction(engine.localGitDirectory, secret, current.Repository.RepositoryID, storageCommitID, localstate.CompactionOperation, transport.ContainsStorageCommit) {
+		reportProgress(progress, "Publication")
+		return nil
+	}
+	temporaryRoot, err := os.MkdirTemp("", "git-remote-cloak-compact-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(temporaryRoot)
+	logicalRepository := filepath.Join(temporaryRoot, "repository.git")
+	state := gitdb.State{LogicalHEAD: current.Repository.LogicalHEAD, ObjectFormat: current.Repository.ObjectFormat, LogicalRefs: current.Repository.LogicalRefs}
+	if err := gitdb.Restore(logicalRepository, true, state, current.Packs); err != nil {
+		return fmt.Errorf("restore source Logical Repository for Compaction: %w", err)
+	}
+	reachableObjectIDs, err := gitdb.ReachableObjectIDs(logicalRepository)
+	if err != nil {
+		return err
+	}
+	repository := current.Repository
+	repository.Generation++
+	repository.PreviousStorageRef = storageCommitID
+	encoded, err := engine.buildCompactedSnapshot(logicalRepository, repository, secret, progress)
+	if err != nil {
+		return err
+	}
+	reportProgress(progress, "Validation")
+	candidate, err := engine.validateCandidate(secret, encoded, state, reachableObjectIDs)
+	if err != nil {
+		return err
+	}
+	reportProgress(progress, "Upload")
+	preparedStorageCommit, err := transport.PrepareRootSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
+	if err != nil {
+		return err
+	}
+	intentID, err := localstate.TransactionIntentID(secret, current.Repository.RepositoryID, []byte("compaction\x00"+storageCommitID))
+	if err != nil {
+		return err
+	}
+	if err := localstate.StoreTransaction(engine.localGitDirectory, localstate.Transaction{
+		IntentID: intentID, StartingStorageCommitID: storageCommitID,
+		PreparedStorageCommitID: preparedStorageCommit, Operation: localstate.CompactionOperation,
+	}, secret, current.Repository.RepositoryID); err != nil {
+		return fmt.Errorf("persist Compaction crash journal before publication: %w", err)
+	}
+	reportProgress(progress, "Publication")
+	if err := transport.PublishPrepared(storageCommitID, preparedStorageCommit); err != nil {
+		return err
+	}
+	if err := localstate.ObserveCheckpoint(engine.localGitDirectory, candidate.Repository.RepositoryID, candidate.Repository.Generation,
+		preparedStorageCommit, candidate.Repository.PreviousStorageRef, transport.StorageHistoryContinues); err != nil {
+		return err
+	}
+	return localstate.RemoveTransaction(engine.localGitDirectory, intentID)
+}
+
+func (engine *Engine) buildCompactedSnapshot(logicalGitDirectory string, repository cloakformat.SnapshotState, secret domain.RecoverySecret, progress ProgressFunc) (cloakformat.EncodedSnapshot, error) {
+	reportProgress(progress, "Packing")
+	var packs []cloakformat.PackPayload
+	if len(repository.LogicalRefs) > 0 {
+		payload, err := gitdb.CreatePack(logicalGitDirectory)
+		if err != nil {
+			return cloakformat.EncodedSnapshot{}, err
+		}
+		packs = []cloakformat.PackPayload{payload}
+	}
+	repository.CompactedSize = 0
+	repository.AddedSinceCompaction = 0
+	reportProgress(progress, "Encryption")
+	encoded, err := engine.formats.EncodeSnapshot(secret, cloakformat.SnapshotInput{Repository: repository, Packs: packs})
+	if err != nil {
+		return cloakformat.EncodedSnapshot{}, err
+	}
+	for attempts := 0; attempts < 3; attempts++ {
+		compactedSize := uint64(len(encoded.Manifest))
+		for _, size := range encoded.PackCiphertextSizes {
+			compactedSize += size
+		}
+		if repository.CompactedSize == compactedSize {
+			break
+		}
+		repository.CompactedSize = compactedSize
+		encoded, err = engine.formats.EncodeSnapshot(secret, cloakformat.SnapshotInput{Repository: repository, Packs: packs})
+		if err != nil {
+			return cloakformat.EncodedSnapshot{}, err
+		}
+	}
+	return encoded, nil
+}
+
+func reportProgress(progress ProgressFunc, phase string) {
+	if progress != nil {
+		progress(phase)
+	}
+}
+
+func (engine *Engine) validateCandidate(secret domain.RecoverySecret, encoded cloakformat.EncodedSnapshot, state gitdb.State, reachableObjectIDs []string) (cloakformat.DecodedSnapshot, error) {
+	candidate, err := engine.formats.DecodeSnapshot(secret, encoded.Bootstrap, encoded.CiphertextObjects)
+	if err != nil {
+		return cloakformat.DecodedSnapshot{}, fmt.Errorf("validate candidate Ciphertext Snapshot: %w", err)
+	}
+	temporaryRoot, err := os.MkdirTemp("", "git-remote-cloak-candidate-")
+	if err != nil {
+		return cloakformat.DecodedSnapshot{}, err
+	}
+	defer os.RemoveAll(temporaryRoot)
+	temporary := filepath.Join(temporaryRoot, "repository.git")
+	candidateState := gitdb.State{LogicalHEAD: candidate.Repository.LogicalHEAD, ObjectFormat: candidate.Repository.ObjectFormat, LogicalRefs: candidate.Repository.LogicalRefs}
+	if err := gitdb.Restore(temporary, true, candidateState, candidate.Packs); err != nil {
+		return cloakformat.DecodedSnapshot{}, fmt.Errorf("validate candidate Logical Repository: %w", err)
+	}
+	if candidateState.LogicalHEAD != state.LogicalHEAD || candidateState.ObjectFormat != state.ObjectFormat || !maps.Equal(candidateState.LogicalRefs, state.LogicalRefs) {
+		return cloakformat.DecodedSnapshot{}, errors.New("candidate Ciphertext Snapshot does not preserve the intended Logical Repository state")
+	}
+	candidateObjectIDs, err := gitdb.ReachableObjectIDs(temporary)
+	if err != nil {
+		return cloakformat.DecodedSnapshot{}, err
+	}
+	if strings.Join(candidateObjectIDs, "\n") != strings.Join(reachableObjectIDs, "\n") {
+		return cloakformat.DecodedSnapshot{}, errors.New("candidate Ciphertext Snapshot does not preserve the intended reachable Git objects")
+	}
+	return candidate, nil
+}
+
+func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat.DecodedSnapshot, storageCommitID, logicalGitDirectory string, secret domain.RecoverySecret, options PublishOptions) error {
 	state, err := gitdb.ReadState(logicalGitDirectory)
 	if err != nil {
 		return err
@@ -364,6 +516,7 @@ func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat
 	if err := gitdb.RejectLFSPointers(logicalGitDirectory, newObjectIDs); err != nil {
 		return err
 	}
+	existingPackCount := len(packs)
 	if len(newObjectIDs) > 0 {
 		payload, err := gitdb.CreatePackForObjects(logicalGitDirectory, newObjectIDs)
 		if err != nil {
@@ -374,7 +527,8 @@ func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat
 	repository := cloakformat.SnapshotState{
 		RepositoryID: current.Repository.RepositoryID, Generation: current.Repository.Generation + 1,
 		LogicalHEAD: state.LogicalHEAD, ObjectFormat: state.ObjectFormat, LogicalRefs: state.LogicalRefs,
-		PreviousStorageRef: storageCommitID,
+		PreviousStorageRef: storageCommitID, CompactedSize: current.Repository.CompactedSize,
+		AddedSinceCompaction: current.Repository.AddedSinceCompaction,
 	}
 	encoded, err := engine.formats.EncodeSnapshot(secret, cloakformat.SnapshotInput{
 		Repository: repository, Packs: packs,
@@ -382,35 +536,73 @@ func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat
 	if err != nil {
 		return err
 	}
+	legacyCompactionDue := repository.CompactedSize == 0 && len(current.Packs) > 0
+	if repository.CompactedSize == 0 && len(current.Packs) == 0 && len(packs) > 0 {
+		for attempts := 0; attempts < 3; attempts++ {
+			compactedSize := uint64(len(encoded.Manifest))
+			for _, size := range encoded.PackCiphertextSizes {
+				compactedSize += size
+			}
+			if repository.CompactedSize == compactedSize {
+				break
+			}
+			repository.CompactedSize = compactedSize
+			encoded, err = engine.formats.EncodeSnapshot(secret, cloakformat.SnapshotInput{Repository: repository, Packs: packs})
+			if err != nil {
+				return err
+			}
+		}
+	} else if repository.CompactedSize > 0 {
+		newPayloadSize := uint64(0)
+		for index := existingPackCount; index < len(encoded.PackCiphertextSizes); index++ {
+			newPayloadSize += encoded.PackCiphertextSizes[index]
+		}
+		baseAdded := current.Repository.AddedSinceCompaction + newPayloadSize
+		for attempts := 0; attempts < 3; attempts++ {
+			added := baseAdded + uint64(len(encoded.Manifest))
+			if repository.AddedSinceCompaction == added {
+				break
+			}
+			repository.AddedSinceCompaction = added
+			encoded, err = engine.formats.EncodeSnapshot(secret, cloakformat.SnapshotInput{Repository: repository, Packs: packs})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if len(packs) == 0 {
+		repository.CompactedSize = 0
+		repository.AddedSinceCompaction = 0
+	}
+	halfCompactedSize := repository.CompactedSize/2 + repository.CompactedSize%2
+	compactionDue := legacyCompactionDue || len(packs) > 32 || repository.CompactedSize > 0 && repository.AddedSinceCompaction >= halfCompactedSize
+	rootPublication := false
+	if compactionDue && options.AutoCompact && len(state.LogicalRefs) > 0 {
+		encoded, err = engine.buildCompactedSnapshot(logicalGitDirectory, repository, secret, options.Progress)
+		if err != nil {
+			return err
+		}
+		rootPublication = true
+	} else if compactionDue && !options.AutoCompact {
+		reportProgress(options.Progress, "Warning: automatic Compaction is disabled and this push exceeds a Ciphertext Repository capacity threshold")
+	}
 	// Validate the exact candidate logical state before uploading any ciphertext.
-	candidate, err := engine.formats.DecodeSnapshot(secret, encoded.Bootstrap, encoded.CiphertextObjects)
-	if err != nil {
-		return fmt.Errorf("validate candidate Ciphertext Snapshot: %w", err)
+	if rootPublication {
+		reportProgress(options.Progress, "Validation")
 	}
-	temporaryRoot, err := os.MkdirTemp("", "git-remote-cloak-candidate-")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(temporaryRoot)
-	temporary := filepath.Join(temporaryRoot, "repository.git")
-	candidateState := gitdb.State{
-		LogicalHEAD: candidate.Repository.LogicalHEAD, ObjectFormat: candidate.Repository.ObjectFormat,
-		LogicalRefs: candidate.Repository.LogicalRefs,
-	}
-	if err := gitdb.Restore(temporary, true, candidateState, candidate.Packs); err != nil {
-		return fmt.Errorf("validate candidate Logical Repository: %w", err)
-	}
-	if candidateState.LogicalHEAD != state.LogicalHEAD || candidateState.ObjectFormat != state.ObjectFormat || !maps.Equal(candidateState.LogicalRefs, state.LogicalRefs) {
-		return errors.New("candidate Ciphertext Snapshot does not preserve the intended Logical Repository state")
-	}
-	candidateObjectIDs, err := gitdb.ReachableObjectIDs(temporary)
+	candidate, err := engine.validateCandidate(secret, encoded, state, reachableObjectIDs)
 	if err != nil {
 		return err
 	}
-	if strings.Join(candidateObjectIDs, "\n") != strings.Join(reachableObjectIDs, "\n") {
-		return errors.New("candidate Ciphertext Snapshot does not preserve the intended reachable Git objects")
+	if rootPublication {
+		reportProgress(options.Progress, "Upload")
 	}
-	preparedStorageCommit, err := transport.PrepareSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
+	var preparedStorageCommit string
+	if rootPublication {
+		preparedStorageCommit, err = transport.PrepareRootSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
+	} else {
+		preparedStorageCommit, err = transport.PrepareSnapshot(storageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
+	}
 	if err != nil {
 		return err
 	}
@@ -425,6 +617,9 @@ func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat
 	}
 	if err := localstate.StoreTransaction(engine.localGitDirectory, journal, secret, current.Repository.RepositoryID); err != nil {
 		return fmt.Errorf("persist crash journal before publication: %w", err)
+	}
+	if rootPublication {
+		reportProgress(options.Progress, "Publication")
 	}
 	if err := transport.PublishPrepared(storageCommitID, preparedStorageCommit); err != nil {
 		return err
@@ -475,6 +670,11 @@ func (engine *Engine) PublishRef(repositoryURL, sourceGitDirectory, sourceRef, d
 
 // PublishRefs applies every requested Logical Ref change and publishes one snapshot or none.
 func (engine *Engine) PublishRefs(repositoryURL, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret) error {
+	return engine.PublishRefsWithOptions(repositoryURL, sourceGitDirectory, updates, secret, defaultPublishOptions())
+}
+
+// PublishRefsWithOptions applies a push with explicit maintenance policy.
+func (engine *Engine) PublishRefsWithOptions(repositoryURL, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret, options PublishOptions) error {
 	if len(updates) == 0 {
 		return errors.New("push transaction contains no Logical Ref updates")
 	}
@@ -493,7 +693,7 @@ func (engine *Engine) PublishRefs(repositoryURL, sourceGitDirectory string, upda
 
 	var concurrentErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		concurrentErr = engine.publishRefAttempt(repositoryURL, sourceGitDirectory, updates, secret)
+		concurrentErr = engine.publishRefAttempt(repositoryURL, sourceGitDirectory, updates, secret, options)
 		if concurrentErr == nil {
 			return nil
 		}
@@ -504,7 +704,7 @@ func (engine *Engine) PublishRefs(repositoryURL, sourceGitDirectory string, upda
 	return fmt.Errorf("compatible concurrent publication did not succeed after 3 attempts: %w", concurrentErr)
 }
 
-func (engine *Engine) publishRefAttempt(repositoryURL, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret) error {
+func (engine *Engine) publishRefAttempt(repositoryURL, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret, options PublishOptions) error {
 	transport, err := storage.OpenGit(repositoryURL)
 	if err != nil {
 		return err
@@ -556,7 +756,7 @@ func (engine *Engine) publishRefAttempt(repositoryURL, sourceGitDirectory string
 			return fmt.Errorf("receive pushed Logical Ref: %s", strings.TrimSpace(string(output)))
 		}
 	}
-	return engine.publishCurrent(transport, current, storageCommitID, temporary, secret)
+	return engine.publishCurrent(transport, current, storageCommitID, temporary, secret, options)
 }
 
 // InspectEmpty authenticates and returns the logical state for a remote-helper adapter.

@@ -64,6 +64,12 @@ func (transport *Git) PublishSnapshot(expectedStorageCommitID string, bootstrap 
 	return commitID, nil
 }
 
+// PrepareRootSnapshot uploads immutable ciphertext and creates a parentless
+// Storage commit for a maintenance rebuild.
+func (transport *Git) PrepareRootSnapshot(expectedStorageCommitID string, bootstrap []byte, ciphertextObjects map[string][]byte) (string, error) {
+	return transport.LocalBare.PrepareRootSnapshot(expectedStorageCommitID, bootstrap, ciphertextObjects)
+}
+
 // PublishPrepared uploads a prepared immutable Storage commit and updates the
 // Storage Ref. Transient transport failures receive at most three attempts.
 func (transport *Git) PublishPrepared(expectedStorageCommitID, commitID string) error {

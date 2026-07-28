@@ -38,7 +38,9 @@ snapshot-manifest = {
   3: tstr .size (1..1024),         ; encrypted Logical HEAD
   4: {*1024 tstr => bytes},        ; encrypted Logical Refs
   5: [*1024 pack-payload-location],
-  6: [*64 uint]                    ; required snapshot features
+  6: [*64 uint],                   ; required snapshot features
+  ? 7: uint,                       ; previous compacted Ciphertext Snapshot ciphertext bytes
+  ? 8: uint                        ; Encrypted Manifest and Pack Payload ciphertext bytes added since Compaction
 }
 
 pack-payload-location = {

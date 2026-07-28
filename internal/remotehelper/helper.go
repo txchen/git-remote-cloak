@@ -26,6 +26,11 @@ type shallowFetchRequest struct {
 
 // Run serves one non-interactive Git remote-helper session.
 func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Reader, output io.Writer) error {
+	return RunWithOptions(repositoryURL, recoverySecret, input, output, engine.PublishOptions{AutoCompact: true})
+}
+
+// RunWithOptions serves a remote-helper session with an explicit maintenance policy.
+func RunWithOptions(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Reader, output io.Writer, publishOptions engine.PublishOptions) error {
 	repositoryEngine := engine.New()
 	if gitDirectory, err := currentGitDirectory(); err == nil {
 		if err := gitdb.RejectPromisorState(gitDirectory); err != nil {
@@ -161,7 +166,7 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 		case command == "" && len(pushes) > 0:
 			gitDirectory, err := currentGitDirectory()
 			if err == nil {
-				err = repositoryEngine.PublishRefs(repositoryURL, gitDirectory, pushes, recoverySecret)
+				err = repositoryEngine.PublishRefsWithOptions(repositoryURL, gitDirectory, pushes, recoverySecret, publishOptions)
 			}
 			if err != nil {
 				for _, push := range pushes {
