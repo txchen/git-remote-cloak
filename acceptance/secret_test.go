@@ -38,7 +38,7 @@ func TestInteractiveInitDisplaysMnemonicOnceAndRequiresConfirmation(t *testing.T
 	if mnemonic == "" {
 		t.Fatalf("no 24-word Recovery Mnemonic in output:\n%s", transcript)
 	}
-	if _, err := terminal.WriteString("SAVED\r"); err != nil {
+	if _, err := terminal.WriteString("SAVED\n"); err != nil {
 		t.Fatal(err)
 	}
 	waitForInteractiveCommand(t, command, transcript)
@@ -65,7 +65,6 @@ func waitForInteractiveCommand(t *testing.T, command *exec.Cmd, transcript strin
 		}
 	case <-time.After(10 * time.Second):
 		_ = command.Process.Kill()
-		<-result
 		t.Fatalf("interactive init did not exit after confirmation\n%s", transcript)
 	}
 }
