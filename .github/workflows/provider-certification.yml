@@ -1,0 +1,71 @@
+name: Provider certification
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment containing disposable provider fixtures and credentials
+        required: true
+        type: choice
+        options:
+          - github-ssh
+          - github-https
+          - gitlab-ssh
+          - gitlab-https
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment }}
+    env:
+      CLOAK_PROVIDER_URL: ${{ secrets.CLOAK_PROVIDER_URL }}
+      CLOAK_PROVIDER_AUTH_REJECT_URL: ${{ secrets.CLOAK_PROVIDER_AUTH_REJECT_URL }}
+      CLOAK_PROVIDER_OBJECT_REJECT_URL: ${{ secrets.CLOAK_PROVIDER_OBJECT_REJECT_URL }}
+      CLOAK_PROVIDER_PROTECTED_URL: ${{ secrets.CLOAK_PROVIDER_PROTECTED_URL }}
+      CLOAK_REQUIRE_PROVIDER_CERTIFICATION: "1"
+      CLOAK_HTTPS_USERNAME: ${{ secrets.CLOAK_HTTPS_USERNAME }}
+      CLOAK_HTTPS_TOKEN: ${{ secrets.CLOAK_HTTPS_TOKEN }}
+      CLOAK_SSH_PRIVATE_KEY: ${{ secrets.CLOAK_SSH_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.5
+          cache: true
+      - name: Configure SSH without provider APIs
+        if: endsWith(inputs.environment, '-ssh')
+        shell: bash
+        run: |
+          install -m 700 -d "$RUNNER_TEMP/ssh"
+          install -m 600 /dev/null "$RUNNER_TEMP/ssh/key"
+          printf '%s\n' "$CLOAK_SSH_PRIVATE_KEY" >"$RUNNER_TEMP/ssh/key"
+          ssh-keyscan github.com gitlab.com >"$RUNNER_TEMP/ssh/known_hosts"
+          printf 'ssh -i %q -o IdentitiesOnly=yes -o UserKnownHostsFile=%q\n' \
+            "$RUNNER_TEMP/ssh/key" "$RUNNER_TEMP/ssh/known_hosts" >"$RUNNER_TEMP/ssh-command"
+          echo "GIT_SSH_COMMAND=$(cat "$RUNNER_TEMP/ssh-command")" >>"$GITHUB_ENV"
+      - name: Configure HTTPS credential helper
+        if: endsWith(inputs.environment, '-https')
+        shell: bash
+        run: |
+          install -m 700 -d "$RUNNER_TEMP/credential-helper"
+          printf '%s\n' '#!/usr/bin/env bash' \
+            'test "${1:-}" = get || exit 0' \
+            'printf "username=%s\\npassword=%s\\n" "$CLOAK_HTTPS_USERNAME" "$CLOAK_HTTPS_TOKEN"' \
+            >"$RUNNER_TEMP/credential-helper/git-credential-cloak-ci"
+          chmod 700 "$RUNNER_TEMP/credential-helper/git-credential-cloak-ci"
+          git config --global credential.helper "$RUNNER_TEMP/credential-helper/git-credential-cloak-ci"
+      - name: Build the production release binary
+        shell: bash
+        run: |
+          scripts/build-release.sh v0.0.0-provider-certification "$RUNNER_TEMP/release"
+          tar -xzf "$RUNNER_TEMP/release/git-remote-cloak_v0.0.0-provider-certification_linux_amd64.tar.gz" -C "$RUNNER_TEMP"
+          echo "CLOAK_BINARY=$RUNNER_TEMP/git-remote-cloak" >>"$GITHUB_ENV"
+      - name: Run local production matrix and provider certification
+        run: go test ./... -count=1
+        env:
+          CGO_ENABLED: "0"

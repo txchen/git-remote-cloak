@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type checkpointStatus struct {
@@ -81,7 +82,9 @@ func TestCompatibleConcurrentWritersRebuildAndPublishBothLogicalRefs(t *testing.
 		exec.Command("git", "push", "origin", "second"),
 	}
 	commands[0].Dir, commands[1].Dir = first, second
-	commands[0].Env, commands[1].Env = cloakGitEnvironment(binary), cloakGitEnvironment(binary)
+	barrier := t.TempDir()
+	commands[0].Env = append(cloakGitEnvironment(binary), "CLOAK_TEST_STORAGE_REF_BARRIER="+barrier, "CLOAK_TEST_STORAGE_REF_PARTICIPANT=first")
+	commands[1].Env = append(cloakGitEnvironment(binary), "CLOAK_TEST_STORAGE_REF_BARRIER="+barrier, "CLOAK_TEST_STORAGE_REF_PARTICIPANT=second")
 	outputs := make([]bytes.Buffer, len(commands))
 	for index, command := range commands {
 		command.Stdout = &outputs[index]
@@ -89,6 +92,10 @@ func TestCompatibleConcurrentWritersRebuildAndPublishBothLogicalRefs(t *testing.
 		if err := command.Start(); err != nil {
 			t.Fatal(err)
 		}
+	}
+	waitForStorageRefBarrier(t, barrier, "first", "second")
+	if err := os.WriteFile(filepath.Join(barrier, "release"), []byte("release\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	for index, command := range commands {
 		if err := command.Wait(); err != nil {
@@ -103,6 +110,25 @@ func TestCompatibleConcurrentWritersRebuildAndPublishBothLogicalRefs(t *testing.
 	if got, want := mustGit(t, recovered, "rev-parse", "origin/second"), mustGit(t, second, "rev-parse", "second"); got != want {
 		t.Fatalf("recovered second ref = %q, want %q", got, want)
 	}
+}
+
+func waitForStorageRefBarrier(t *testing.T, directory string, participants ...string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		allReady := true
+		for _, participant := range participants {
+			if _, err := os.Stat(filepath.Join(directory, participant+".ready")); err != nil {
+				allReady = false
+				break
+			}
+		}
+		if allReady {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("writers did not reach the deterministic Storage Ref barrier: %v", participants)
 }
 
 func TestLocalOperationLockRejectsAConflictingPublication(t *testing.T) {

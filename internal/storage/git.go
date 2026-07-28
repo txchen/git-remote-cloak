@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Git is the production Storage Transport adapter for local, SSH, and HTTPS Repository Hosts.
@@ -18,6 +20,11 @@ type Git struct {
 // ErrConcurrentUpdate reports that another writer changed the Storage Ref
 // after this transport read it.
 var ErrConcurrentUpdate = errors.New("Storage Ref changed concurrently")
+
+var (
+	testStorageRefBarrierOnce sync.Once
+	testStorageRefBarrierErr  error
+)
 
 // OpenGit clones the Repository Host through ordinary Git transport into restrictive local storage.
 func OpenGit(repositoryURL string) (*Git, error) {
@@ -73,6 +80,9 @@ func (transport *Git) PrepareRootSnapshot(expectedStorageCommitID string, bootst
 // PublishPrepared uploads a prepared immutable Storage commit and updates the
 // Storage Ref. Transient transport failures receive at most three attempts.
 func (transport *Git) PublishPrepared(expectedStorageCommitID, commitID string) error {
+	if err := waitAtTestStorageRefBarrier(); err != nil {
+		return err
+	}
 	if os.Getenv("CLOAK_TEST_FAULT") == "before-storage-ref" {
 		return errors.New("injected interruption before Storage Ref publication")
 	}
@@ -121,6 +131,36 @@ func (transport *Git) PublishPrepared(expectedStorageCommitID, commitID string) 
 		}
 	}
 	return fmt.Errorf("compare-and-swap publish Storage Ref through ordinary Git transport failed after at most 3 attempts: %w", lastError)
+}
+
+func waitAtTestStorageRefBarrier() error {
+	directory := os.Getenv("CLOAK_TEST_STORAGE_REF_BARRIER")
+	participant := os.Getenv("CLOAK_TEST_STORAGE_REF_PARTICIPANT")
+	if directory == "" && participant == "" {
+		return nil
+	}
+	testStorageRefBarrierOnce.Do(func() {
+		if directory == "" || participant == "" || filepath.Base(participant) != participant {
+			testStorageRefBarrierErr = errors.New("invalid test Storage Ref barrier configuration")
+			return
+		}
+		if err := os.WriteFile(filepath.Join(directory, participant+".ready"), []byte("ready\n"), 0o600); err != nil {
+			testStorageRefBarrierErr = fmt.Errorf("signal test Storage Ref barrier: %w", err)
+			return
+		}
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(filepath.Join(directory, "release")); err == nil {
+				return
+			} else if !os.IsNotExist(err) {
+				testStorageRefBarrierErr = fmt.Errorf("inspect test Storage Ref barrier: %w", err)
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		testStorageRefBarrierErr = errors.New("timed out waiting at test Storage Ref barrier")
+	})
+	return testStorageRefBarrierErr
 }
 
 func concurrentPushError(message string) bool {

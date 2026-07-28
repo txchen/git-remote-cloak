@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 
 	"github.com/txchen/git-remote-cloak/internal/domain"
@@ -16,6 +17,13 @@ import (
 	"github.com/txchen/git-remote-cloak/internal/remotehelper"
 	"github.com/txchen/git-remote-cloak/internal/secret"
 	"golang.org/x/term"
+)
+
+var (
+	buildVersion = "dev"
+	buildCommit  = "unknown"
+	buildDate    = "unknown"
+	buildCGo     = "unknown"
 )
 
 func main() {
@@ -446,16 +454,29 @@ func runSetHead(arguments []string) error {
 
 func runVersion(arguments []string) error {
 	capabilities := cloakformat.NewRegistry().Capabilities()
+	if len(arguments) == 0 {
+		fmt.Printf("git-remote-cloak %s\ncommit: %s\nbuilt: %s\ngo: %s\nplatform: %s/%s\ncgo: %s\nformats:\n",
+			buildVersion, buildCommit, buildDate, runtime.Version(), runtime.GOOS, runtime.GOARCH, buildCGo)
+		printFormatCapabilities(capabilities)
+		return nil
+	}
+	if len(arguments) == 1 && arguments[0] == "--json" {
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			Version   string                   `json:"version"`
+			Commit    string                   `json:"commit"`
+			Built     string                   `json:"built"`
+			GoVersion string                   `json:"go_version"`
+			Platform  string                   `json:"platform"`
+			CGo       string                   `json:"cgo"`
+			Formats   []cloakformat.Capability `json:"formats"`
+		}{
+			Version: buildVersion, Commit: buildCommit, Built: buildDate,
+			GoVersion: runtime.Version(), Platform: runtime.GOOS + "/" + runtime.GOARCH,
+			CGo: buildCGo, Formats: capabilities,
+		})
+	}
 	if len(arguments) == 1 && arguments[0] == "--formats" {
-		for _, capability := range capabilities {
-			requiredFeatures := "none"
-			if len(capability.RequiredFeatures) > 0 {
-				requiredFeatures = strings.Join(capability.RequiredFeatures, ",")
-			}
-			fmt.Printf("v%d.%d read=%s write=%s cryptographic-suite=%s required-features=%s\n",
-				capability.Major, capability.Minor, yesNo(capability.Read), yesNo(capability.Write),
-				capability.CryptographicSuite, requiredFeatures)
-		}
+		printFormatCapabilities(capabilities)
 		return nil
 	}
 	if len(arguments) == 2 && arguments[0] == "--formats" && arguments[1] == "--json" {
@@ -463,7 +484,19 @@ func runVersion(arguments []string) error {
 			Formats []cloakformat.Capability `json:"formats"`
 		}{Formats: capabilities})
 	}
-	return fmt.Errorf("usage: git-remote-cloak version --formats [--json]")
+	return fmt.Errorf("usage: git-remote-cloak version <--json|--formats [--json]>")
+}
+
+func printFormatCapabilities(capabilities []cloakformat.Capability) {
+	for _, capability := range capabilities {
+		requiredFeatures := "none"
+		if len(capability.RequiredFeatures) > 0 {
+			requiredFeatures = strings.Join(capability.RequiredFeatures, ",")
+		}
+		fmt.Printf("v%d.%d read=%s write=%s cryptographic-suite=%s required-features=%s\n",
+			capability.Major, capability.Minor, yesNo(capability.Read), yesNo(capability.Write),
+			capability.CryptographicSuite, requiredFeatures)
+	}
 }
 
 func yesNo(value bool) string {
