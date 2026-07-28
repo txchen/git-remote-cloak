@@ -103,9 +103,16 @@ func TestFailedStorageRefPublicationLeavesPreviousSnapshotAuthoritative(t *testi
 }
 
 func cloakGitEnvironment(binary string) []string {
-	return append(withoutEnvironment(os.Environ(), "CLOAK_RECOVERY_SECRET", "CLOAK_RECOVERY_SECRET_FILE"),
+	return append(withoutEnvironment(os.Environ(),
+		"CLOAK_RECOVERY_SECRET", "CLOAK_RECOVERY_SECRET_FILE",
+		"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+	),
 		"CLOAK_RECOVERY_SECRET="+testMnemonic,
 		"PATH="+filepath.Dir(binary)+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=Cloak Test",
+		"GIT_AUTHOR_EMAIL=cloak@example.invalid",
+		"GIT_COMMITTER_NAME=Cloak Test",
+		"GIT_COMMITTER_EMAIL=cloak@example.invalid",
 	)
 }

@@ -202,19 +202,28 @@ func TestInitRejectsInvalidSecretInputsWithoutMutation(t *testing.T) {
 
 func readPTYUntil(t *testing.T, terminal *os.File, marker string) string {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
 	var output strings.Builder
-	buffer := make([]byte, 512)
 	for !strings.Contains(output.String(), marker) {
-		if err := terminal.SetReadDeadline(deadline); err != nil {
-			t.Fatal(err)
+		type readResult struct {
+			contents []byte
+			err      error
 		}
-		count, err := terminal.Read(buffer)
-		if count > 0 {
-			output.Write(buffer[:count])
-		}
-		if err != nil {
-			t.Fatalf("reading interactive output: %v\n%s", err, output.String())
+		result := make(chan readResult, 1)
+		go func() {
+			buffer := make([]byte, 512)
+			count, err := terminal.Read(buffer)
+			result <- readResult{contents: buffer[:count], err: err}
+		}()
+		select {
+		case read := <-result:
+			output.Write(read.contents)
+			if read.err != nil {
+				t.Fatalf("reading interactive output: %v\n%s", read.err, output.String())
+			}
+		case <-timeout.C:
+			t.Fatalf("timed out reading interactive output\n%s", output.String())
 		}
 	}
 	return output.String()

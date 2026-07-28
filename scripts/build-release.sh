@@ -22,7 +22,11 @@ if [[ ! "${source_epoch}" =~ ^[0-9]+$ ]]; then
   echo "SOURCE_DATE_EPOCH must be an integer Unix timestamp" >&2
   exit 2
 fi
-readonly build_date="$(date -u -d "@${source_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+if build_date="$(date -u -d "@${source_epoch}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"; then
+  readonly build_date
+else
+  readonly build_date="$(date -u -r "${source_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+fi
 readonly build_commit="$(git -C "${repository_root}" rev-parse HEAD)"
 readonly temporary_directory="$(mktemp -d)"
 trap 'rm -rf -- "${temporary_directory}"' EXIT
@@ -42,11 +46,15 @@ for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
       -o "${stage}/git-remote-cloak" ./cmd/git-remote-cloak
   )
   archive="git-remote-cloak_${release_version}_${target_os}_${target_arch}.tar.gz"
-  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${source_epoch}" \
-    -C "${stage}" -cf - git-remote-cloak | gzip -n >"${output_directory}/${archive}"
+  go run -mod=readonly "${repository_root}/scripts/release-archive.go" \
+    "${source_epoch}" "${stage}/git-remote-cloak" "${output_directory}/${archive}"
 done
 
 (
   cd "${output_directory}"
-  sha256sum git-remote-cloak_*.tar.gz >checksums.txt
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum git-remote-cloak_*.tar.gz >checksums.txt
+  else
+    shasum -a 256 git-remote-cloak_*.tar.gz >checksums.txt
+  fi
 )
