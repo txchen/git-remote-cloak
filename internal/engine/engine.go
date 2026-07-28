@@ -35,6 +35,19 @@ type PublishOptions struct {
 	Progress    ProgressFunc
 }
 
+// RekeyPlan is the complete local authority selected before destructive
+// confirmation.
+type RekeyPlan struct {
+	selectedRepository         gitdb.State
+	SelectedRefs               []domain.LogicalRefName
+	RemoteTrackingWithoutLocal []string
+}
+
+// RekeyResult identifies the newly published Ciphertext Repository.
+type RekeyResult struct {
+	RepositoryID domain.RepositoryID
+}
+
 func defaultPublishOptions() PublishOptions { return PublishOptions{AutoCompact: true} }
 
 // New returns a production Repository Engine.
@@ -44,6 +57,28 @@ func New() *Engine { return &Engine{formats: cloakformat.NewRegistry()} }
 // state owned by gitDirectory.
 func NewWithLocalState(gitDirectory string) *Engine {
 	return &Engine{formats: cloakformat.NewRegistry(), localGitDirectory: gitDirectory}
+}
+
+// PlanRekey selects local authority without reading or authenticating the
+// existing Ciphertext Repository.
+func (engine *Engine) PlanRekey(logicalGitDirectory string, refspecs []string) (RekeyPlan, error) {
+	if err := gitdb.RejectPromisorState(logicalGitDirectory); err != nil {
+		return RekeyPlan{}, err
+	}
+	state, err := gitdb.ReadSelectedState(logicalGitDirectory, refspecs)
+	if err != nil {
+		return RekeyPlan{}, err
+	}
+	warnings, err := gitdb.RemoteTrackingWithoutLocal(logicalGitDirectory)
+	if err != nil {
+		return RekeyPlan{}, err
+	}
+	refs := make([]domain.LogicalRefName, 0, len(state.LogicalRefs))
+	for name := range state.LogicalRefs {
+		refs = append(refs, domain.LogicalRefName(name))
+	}
+	sort.Slice(refs, func(left, right int) bool { return refs[left] < refs[right] })
+	return RekeyPlan{selectedRepository: state, SelectedRefs: refs, RemoteTrackingWithoutLocal: warnings}, nil
 }
 
 // Initialize publishes or verifies an empty Ciphertext Repository and configures a remote.
@@ -406,11 +441,97 @@ func (engine *Engine) Compact(repositoryURL string, secret domain.RecoverySecret
 	return localstate.RemoveTransaction(engine.localGitDirectory, intentID)
 }
 
+// Rekey replaces the Storage Ref from a complete selected local Logical
+// Repository without reading or authenticating the old Ciphertext Snapshot.
+func (engine *Engine) Rekey(repositoryURL, logicalGitDirectory string, plan RekeyPlan, secret domain.RecoverySecret, progress ProgressFunc) (RekeyResult, error) {
+	if repositoryURL == "" || len(plan.SelectedRefs) == 0 || len(plan.selectedRepository.LogicalRefs) == 0 {
+		return RekeyResult{}, errors.New("Rekey requires a non-empty selected local Logical Repository")
+	}
+	operationLock, err := localstate.AcquireOperationLock(engine.localGitDirectory)
+	if err != nil {
+		return RekeyResult{}, err
+	}
+	defer operationLock.Close()
+	reachableObjectIDs, err := gitdb.ReachableObjectIDsForRefs(logicalGitDirectory, plan.selectedRepository.LogicalRefs)
+	if err != nil {
+		return RekeyResult{}, err
+	}
+	if err := gitdb.RejectLFSPointers(logicalGitDirectory, reachableObjectIDs); err != nil {
+		return RekeyResult{}, err
+	}
+	transport, err := storage.OpenGit(repositoryURL)
+	if err != nil {
+		return RekeyResult{}, err
+	}
+	defer transport.Close()
+	refs, err := transport.Refs()
+	if err != nil {
+		return RekeyResult{}, err
+	}
+	if len(refs) != 1 || refs[0] != storage.StorageRef {
+		return RekeyResult{}, errors.New("Repository Host must contain exactly the Cloak Storage Ref")
+	}
+	startingStorageCommitID, err := transport.Current()
+	if err != nil {
+		return RekeyResult{}, err
+	}
+	repository := cloakformat.SnapshotState{
+		Generation: 1, LogicalHEAD: plan.selectedRepository.LogicalHEAD, ObjectFormat: plan.selectedRepository.ObjectFormat,
+		LogicalRefs: maps.Clone(plan.selectedRepository.LogicalRefs),
+	}
+	if _, err := rand.Read(repository.RepositoryID[:]); err != nil {
+		return RekeyResult{}, fmt.Errorf("generate new Repository ID: %w", err)
+	}
+	encoded, err := engine.buildCompactedSnapshotForObjects(logicalGitDirectory, repository, secret, progress, reachableObjectIDs)
+	if err != nil {
+		return RekeyResult{}, err
+	}
+	reportProgress(progress, "Validation")
+	if os.Getenv("CLOAK_TEST_FAULT") == "candidate-validation" {
+		return RekeyResult{}, errors.New("injected candidate validation failure")
+	}
+	candidate, err := engine.validateCandidate(secret, encoded, plan.selectedRepository, reachableObjectIDs)
+	if err != nil {
+		return RekeyResult{}, err
+	}
+	reportProgress(progress, "Upload")
+	preparedStorageCommit, err := transport.PrepareRootSnapshot(startingStorageCommitID, encoded.Bootstrap, encoded.CiphertextObjects)
+	if err != nil {
+		return RekeyResult{}, err
+	}
+	reportProgress(progress, "Publication")
+	if publicationErr := transport.PublishPrepared(startingStorageCommitID, preparedStorageCommit); publicationErr != nil {
+		verificationTransport, verificationErr := storage.OpenGit(repositoryURL)
+		if verificationErr != nil {
+			return RekeyResult{}, publicationErr
+		}
+		observedStorageCommit, currentErr := verificationTransport.Current()
+		_ = verificationTransport.Close()
+		if currentErr != nil || observedStorageCommit != preparedStorageCommit {
+			return RekeyResult{}, publicationErr
+		}
+	}
+	if engine.localGitDirectory != "" {
+		if err := localstate.ReplaceCheckpoint(engine.localGitDirectory, candidate.Repository.RepositoryID, 1, preparedStorageCommit); err != nil {
+			return RekeyResult{}, fmt.Errorf("install new Rollback Checkpoint: %w", err)
+		}
+	}
+	return RekeyResult{RepositoryID: candidate.Repository.RepositoryID}, nil
+}
+
 func (engine *Engine) buildCompactedSnapshot(logicalGitDirectory string, repository cloakformat.SnapshotState, secret domain.RecoverySecret, progress ProgressFunc) (cloakformat.EncodedSnapshot, error) {
+	objectIDs, err := gitdb.ReachableObjectIDsForRefs(logicalGitDirectory, repository.LogicalRefs)
+	if err != nil {
+		return cloakformat.EncodedSnapshot{}, err
+	}
+	return engine.buildCompactedSnapshotForObjects(logicalGitDirectory, repository, secret, progress, objectIDs)
+}
+
+func (engine *Engine) buildCompactedSnapshotForObjects(logicalGitDirectory string, repository cloakformat.SnapshotState, secret domain.RecoverySecret, progress ProgressFunc, objectIDs []string) (cloakformat.EncodedSnapshot, error) {
 	reportProgress(progress, "Packing")
 	var packs []cloakformat.PackPayload
 	if len(repository.LogicalRefs) > 0 {
-		payload, err := gitdb.CreatePack(logicalGitDirectory)
+		payload, err := gitdb.CreatePackForObjects(logicalGitDirectory, objectIDs)
 		if err != nil {
 			return cloakformat.EncodedSnapshot{}, err
 		}

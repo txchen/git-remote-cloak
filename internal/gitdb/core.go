@@ -28,26 +28,140 @@ func ReadState(gitDirectory string) (State, error) {
 	if err != nil {
 		return State{}, fmt.Errorf("read Logical HEAD: %w", err)
 	}
+	objectFormat, refs, err := readObjectFormatAndRefs(gitDirectory)
+	if err != nil {
+		return State{}, err
+	}
+	for name := range refs {
+		if !domain.LogicalRefName(name).IsStorable() {
+			return State{}, errors.New("Logical Repository contains an unsupported ref")
+		}
+	}
+	return State{LogicalHEAD: domain.LogicalHEAD(strings.TrimSpace(string(head))), ObjectFormat: objectFormat, LogicalRefs: refs}, nil
+}
+
+// ReadSelectedState selects every local head and tag plus refs matched by the
+// explicit refspecs. Remote-tracking and local operational refs are never
+// selectable as Logical Refs.
+func ReadSelectedState(gitDirectory string, refspecs []string) (State, error) {
+	head, err := run(gitDirectory, nil, "symbolic-ref", "HEAD")
+	if err != nil {
+		return State{}, errors.New("Rekey requires a symbolic local HEAD")
+	}
+	objectFormat, available, err := readObjectFormatAndRefs(gitDirectory)
+	if err != nil {
+		return State{}, err
+	}
+	selected := make(map[string]string)
+	for name, objectID := range available {
+		if domain.LogicalRefName(name).IsSupported() {
+			selected[name] = objectID
+		}
+	}
+	for _, refspec := range refspecs {
+		matched, err := applySelectionRefspec(selected, available, refspec)
+		if err != nil {
+			return State{}, err
+		}
+		if !matched {
+			return State{}, fmt.Errorf("explicit Rekey refspec %q matches no local ref", refspec)
+		}
+	}
+	logicalHEAD := strings.TrimSpace(string(head))
+	if _, exists := selected[logicalHEAD]; !exists {
+		return State{}, errors.New("Logical HEAD must select a local branch included by Rekey")
+	}
+	return State{LogicalHEAD: domain.LogicalHEAD(logicalHEAD), ObjectFormat: objectFormat, LogicalRefs: selected}, nil
+}
+
+func readObjectFormatAndRefs(gitDirectory string) (string, map[string]string, error) {
 	objectFormat, err := run(gitDirectory, nil, "rev-parse", "--show-object-format")
 	if err != nil {
-		return State{}, fmt.Errorf("read Git object format: %w", err)
+		return "", nil, fmt.Errorf("read Git object format: %w", err)
 	}
-	refOutput, err := run(gitDirectory, nil, "for-each-ref", "--format=%(refname) %(objectname)")
+	output, err := run(gitDirectory, nil, "for-each-ref", "--format=%(refname) %(objectname)")
 	if err != nil {
-		return State{}, fmt.Errorf("read Logical Refs: %w", err)
+		return "", nil, fmt.Errorf("enumerate local refs: %w", err)
 	}
 	refs := make(map[string]string)
-	for _, line := range strings.Split(strings.TrimSpace(string(refOutput)), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 		if line == "" {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) != 2 || !domain.LogicalRefName(fields[0]).IsSupported() {
-			return State{}, errors.New("Logical Repository contains an unsupported ref")
+		if len(fields) != 2 {
+			return "", nil, errors.New("Git returned malformed local ref metadata")
 		}
 		refs[fields[0]] = fields[1]
 	}
-	return State{LogicalHEAD: domain.LogicalHEAD(strings.TrimSpace(string(head))), ObjectFormat: strings.TrimSpace(string(objectFormat)), LogicalRefs: refs}, nil
+	return strings.TrimSpace(string(objectFormat)), refs, nil
+}
+
+func applySelectionRefspec(selected, available map[string]string, refspec string) (bool, error) {
+	if refspec == "" || strings.HasPrefix(refspec, "+") || strings.HasPrefix(refspec, ":") {
+		return false, fmt.Errorf("invalid Rekey refspec %q", refspec)
+	}
+	source, destination, hasDestination := strings.Cut(refspec, ":")
+	if strings.Contains(destination, ":") || !strings.HasPrefix(source, "refs/") || strings.Count(source, "*") > 1 {
+		return false, fmt.Errorf("invalid Rekey refspec %q", refspec)
+	}
+	if !hasDestination {
+		destination = source
+	}
+	if strings.Count(destination, "*") != strings.Count(source, "*") {
+		return false, fmt.Errorf("invalid Rekey refspec %q", refspec)
+	}
+	sourcePrefix, sourceSuffix, wildcard := strings.Cut(source, "*")
+	destinationPrefix, destinationSuffix, _ := strings.Cut(destination, "*")
+	matched := false
+	for name, objectID := range available {
+		middle := ""
+		if wildcard {
+			if !strings.HasPrefix(name, sourcePrefix) || !strings.HasSuffix(name, sourceSuffix) || len(name) < len(sourcePrefix)+len(sourceSuffix) {
+				continue
+			}
+			middle = name[len(sourcePrefix) : len(name)-len(sourceSuffix)]
+		} else if name != source {
+			continue
+		}
+		if !domain.LogicalRefName(name).IsStorable() {
+			return false, fmt.Errorf("Rekey cannot select remote-tracking or operational ref %s", name)
+		}
+		target := destinationPrefix + middle + destinationSuffix
+		if !domain.LogicalRefName(target).IsStorable() {
+			return false, fmt.Errorf("Rekey refspec %q has an invalid destination", refspec)
+		}
+		if existing, exists := selected[target]; exists && existing != objectID {
+			return false, fmt.Errorf("Rekey refspec %q collides at %s", refspec, target)
+		}
+		selected[target] = objectID
+		matched = true
+	}
+	return matched, nil
+}
+
+// RemoteTrackingWithoutLocal returns remote-tracking branches whose short
+// branch name is absent from local heads.
+func RemoteTrackingWithoutLocal(gitDirectory string) ([]string, error) {
+	output, err := run(gitDirectory, nil, "for-each-ref", "--format=%(refname)", "refs/remotes")
+	if err != nil {
+		return nil, fmt.Errorf("enumerate remote-tracking branches: %w", err)
+	}
+	var warnings []string
+	for _, remoteRef := range strings.Fields(string(output)) {
+		parts := strings.SplitN(strings.TrimPrefix(remoteRef, "refs/remotes/"), "/", 2)
+		if len(parts) != 2 || parts[1] == "HEAD" {
+			continue
+		}
+		_, found, err := runOptional(gitDirectory, "show-ref", "--verify", "--quiet", "refs/heads/"+parts[1])
+		if err != nil {
+			return nil, err
+		} else if !found {
+			warnings = append(warnings, remoteRef)
+		}
+	}
+	sort.Strings(warnings)
+	return warnings, nil
 }
 
 // CreatePack creates one self-contained native pack and its exact reachable object index.
@@ -75,6 +189,34 @@ func CreatePackForObjects(gitDirectory string, objectIDs []string) (cloakformat.
 // ReachableObjectIDs returns the exact sorted object IDs reachable from supported Logical Refs.
 func ReachableObjectIDs(gitDirectory string) ([]string, error) {
 	return reachableObjectIDs(gitDirectory)
+}
+
+// ReachableObjectIDsForRefs returns exactly the objects reachable from refs.
+func ReachableObjectIDsForRefs(gitDirectory string, refs map[string]string) ([]string, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	input := make([]string, 0, len(refs))
+	for _, objectID := range refs {
+		input = append(input, objectID)
+	}
+	sort.Strings(input)
+	output, err := run(gitDirectory, []byte(strings.Join(input, "\n")+"\n"), "rev-list", "--objects", "--stdin")
+	if err != nil {
+		return nil, fmt.Errorf("enumerate selected reachable Git objects: %w", err)
+	}
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if fields := strings.Fields(line); len(fields) > 0 {
+			seen[fields[0]] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
 // Import adds authenticated Pack Payloads to an existing local Git object database.

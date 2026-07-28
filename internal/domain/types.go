@@ -20,3 +20,24 @@ func (name LogicalRefName) IsSupported() bool {
 	value := string(name)
 	return strings.HasPrefix(value, "refs/heads/") || strings.HasPrefix(value, "refs/tags/")
 }
+
+// IsStorable reports whether a ref may be preserved as an explicitly selected
+// Logical Ref. Ordinary push remains limited to IsSupported's heads and tags.
+func (name LogicalRefName) IsStorable() bool {
+	value := string(name)
+	if !strings.HasPrefix(value, "refs/") || strings.HasSuffix(value, "/") || strings.HasSuffix(value, ".") ||
+		strings.Contains(value, "//") || strings.Contains(value, "..") || strings.Contains(value, "@{") ||
+		strings.ContainsAny(value, " ~^:?*[\\") {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return value != "refs/stash" && !strings.HasPrefix(value, "refs/remotes/") &&
+		!strings.HasPrefix(value, "refs/bisect/") && !strings.HasPrefix(value, "refs/rewritten/") &&
+		!strings.HasPrefix(value, "refs/replace/") && !strings.HasPrefix(value, "refs/worktree/") &&
+		!strings.HasPrefix(value, "refs/original/") && !strings.HasPrefix(value, "refs/prefetch/") &&
+		!strings.HasPrefix(value, "refs/bundle/")
+}

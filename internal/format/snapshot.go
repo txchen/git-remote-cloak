@@ -366,8 +366,8 @@ func (r *Registry) DecodeSnapshotFrom(secret domain.RecoverySecret, bootstrap []
 	for name, objectID := range manifest.LogicalRefs {
 		repository.LogicalRefs[name] = hex.EncodeToString(objectID)
 	}
-	if repository.Generation == 1 {
-		if len(repository.LogicalRefs) != 0 || len(manifest.PackPayloads) != 0 || repository.RepositoryID == ([16]byte{}) ||
+	if repository.Generation == 1 && len(repository.LogicalRefs) == 0 && len(manifest.PackPayloads) == 0 {
+		if repository.RepositoryID == ([16]byte{}) ||
 			!strings.HasPrefix(string(repository.LogicalHEAD), "refs/heads/") || repository.ObjectFormat != "sha1" && repository.ObjectFormat != "sha256" {
 			return DecodedSnapshot{}, errors.New("invalid empty Ciphertext Snapshot")
 		}
@@ -558,7 +558,7 @@ func (r *Registry) decodeCanonical(data []byte, target any, name string) error {
 }
 
 func validateSnapshotRepository(repository SnapshotState) error {
-	if repository.RepositoryID == ([16]byte{}) || repository.Generation < 2 {
+	if repository.RepositoryID == ([16]byte{}) || repository.Generation < 1 {
 		return errors.New("invalid non-empty Ciphertext Snapshot identity or generation")
 	}
 	if repository.LogicalHEAD == "" || !strings.HasPrefix(string(repository.LogicalHEAD), "refs/heads/") || repository.ObjectFormat != "sha1" && repository.ObjectFormat != "sha256" {
@@ -572,7 +572,7 @@ func validateSnapshotRepository(repository SnapshotState) error {
 		objectIDBytes = 32
 	}
 	for name, objectID := range repository.LogicalRefs {
-		if !domain.LogicalRefName(name).IsSupported() || len(name) > 1024 || len(objectID) != objectIDBytes*2 {
+		if !domain.LogicalRefName(name).IsStorable() || len(name) > 1024 || len(objectID) != objectIDBytes*2 {
 			return errors.New("invalid Logical Ref metadata")
 		}
 	}

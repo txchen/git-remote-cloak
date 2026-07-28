@@ -79,6 +79,19 @@ func (transport *Git) PublishPrepared(expectedStorageCommitID, commitID string) 
 	if os.Getenv("CLOAK_TEST_FAULT") == "lost-process-before-storage-ref" {
 		os.Exit(86)
 	}
+	if os.Getenv("CLOAK_TEST_FAULT") == "stale-storage-ref" && expectedStorageCommitID != transport.zeroObject {
+		tree, err := runGit(transport.path, nil, "rev-parse", expectedStorageCommitID+"^{tree}")
+		if err != nil {
+			return err
+		}
+		concurrentCommit, err := runGit(transport.path, []byte("concurrent storage publication\n"), "commit-tree", strings.TrimSpace(string(tree)), "-p", expectedStorageCommitID)
+		if err != nil {
+			return err
+		}
+		if _, err := runGit(transport.path, nil, "push", "origin", strings.TrimSpace(string(concurrentCommit))+":"+StorageRef); err != nil {
+			return err
+		}
+	}
 	lease := "--force-with-lease=" + StorageRef + ":" + expectedStorageCommitID
 	if expectedStorageCommitID == transport.zeroObject {
 		lease = "--force-with-lease=" + StorageRef + ":"

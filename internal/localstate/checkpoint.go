@@ -100,6 +100,15 @@ func StoreCheckpoint(gitDirectory string, checkpoint Checkpoint) error {
 	return atomicWrite(checkpointPath(gitDirectory), append(contents, '\n'))
 }
 
+// ReplaceCheckpoint installs trusted state for a deliberately confirmed new
+// Ciphertext Repository identity, such as a successful Rekey publication.
+func ReplaceCheckpoint(gitDirectory string, repositoryID domain.RepositoryID, generation uint64, storageCommitID string) error {
+	return StoreCheckpoint(gitDirectory, Checkpoint{
+		Version: checkpointVersion, RepositoryID: hex.EncodeToString(repositoryID[:]),
+		HighestAuthenticatedGeneration: generation, LastSeenStorageCommitID: storageCommitID,
+	})
+}
+
 func checkpointPath(gitDirectory string) string {
 	return filepath.Join(gitDirectory, "cloak", "state")
 }

@@ -46,6 +46,8 @@ func run(arguments []string) error {
 		return runSetHead(arguments[1:])
 	case "compact":
 		return runCompact(arguments[1:])
+	case "rekey":
+		return runRekey(arguments[1:])
 	default:
 		if len(arguments) == 2 {
 			recoverySecret, err := acquireSecret("", false)
@@ -63,6 +65,118 @@ func run(arguments []string) error {
 		}
 		return usageError()
 	}
+}
+
+func runRekey(arguments []string) error {
+	remoteName, refspecs, confirmed, err := parseRekeyArguments(arguments)
+	if err != nil {
+		return err
+	}
+	workspace, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	gitDirectory, err := absoluteGitDirectory()
+	if err != nil {
+		return errors.New("rekey must run inside a complete local Logical Repository")
+	}
+	configuredURL, err := exec.Command("git", "-C", workspace, "remote", "get-url", remoteName).Output()
+	if err != nil {
+		return fmt.Errorf("read Cloak remote %s", remoteName)
+	}
+	repositoryURL, found := strings.CutPrefix(strings.TrimSpace(string(configuredURL)), "cloak::")
+	if !found || repositoryURL == "" {
+		return errors.New("configured remote is not a Cloak remote")
+	}
+	repositoryEngine := engine.NewWithLocalState(gitDirectory)
+	plan, err := repositoryEngine.PlanRekey(gitDirectory, refspecs)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Rekey will replace the Ciphertext Repository from these selected Logical Refs:")
+	for _, name := range plan.SelectedRefs {
+		fmt.Printf("  %s\n", name)
+	}
+	for _, name := range plan.RemoteTrackingWithoutLocal {
+		fmt.Printf("Warning: remote-tracking branch %s has no corresponding local branch and will not be selected.\n", name)
+	}
+	input := bufio.NewReader(os.Stdin)
+	if !confirmed {
+		fmt.Print("Type REKEY to replace the Ciphertext Repository: ")
+		answer, readErr := input.ReadString('\n')
+		if readErr != nil && len(answer) == 0 {
+			return fmt.Errorf("read Rekey confirmation: %w", readErr)
+		}
+		if strings.TrimSpace(answer) != "REKEY" {
+			return errors.New("Rekey cancelled; Ciphertext Repository was not changed")
+		}
+	}
+	newSecret, err := acquireNewSecret(input)
+	if err != nil {
+		return err
+	}
+	result, err := repositoryEngine.Rekey(repositoryURL, gitDirectory, plan, newSecret, func(phase string) {
+		fmt.Printf("%s Rekey candidate.\n", phase)
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := exec.Command("git", "-C", workspace, "config", "remote."+remoteName+".cloakRepositoryID", fmt.Sprintf("%x", result.RepositoryID[:])).CombinedOutput(); err != nil {
+		return fmt.Errorf("record new public Repository ID: %w", err)
+	}
+	fmt.Println("Rekey published a validated generation-one Ciphertext Snapshot with a new Repository ID.")
+	fmt.Println("Warning: Repository Host retention may preserve ciphertext recoverable with the old Recovery Secret; Rekey cannot guarantee erasure or immediate quota recovery.")
+	return nil
+}
+
+func parseRekeyArguments(arguments []string) (remoteName string, refspecs []string, confirmed bool, err error) {
+	for index := 0; index < len(arguments); index++ {
+		switch arguments[index] {
+		case "--yes":
+			if confirmed {
+				return "", nil, false, errors.New("usage: git-remote-cloak rekey <remote-name> [refspec ...] [--yes]")
+			}
+			confirmed = true
+		default:
+			if strings.HasPrefix(arguments[index], "-") {
+				return "", nil, false, errors.New("usage: git-remote-cloak rekey <remote-name> [refspec ...] [--yes]")
+			}
+			if remoteName == "" {
+				remoteName = arguments[index]
+			} else {
+				refspecs = append(refspecs, arguments[index])
+			}
+		}
+	}
+	if remoteName == "" {
+		return "", nil, false, errors.New("usage: git-remote-cloak rekey <remote-name> [refspec ...] [--yes]")
+	}
+	return remoteName, refspecs, confirmed, nil
+}
+
+func acquireNewSecret(input *bufio.Reader) (domain.RecoverySecret, error) {
+	if _, environmentSet := os.LookupEnv("CLOAK_RECOVERY_SECRET"); environmentSet {
+		return acquireSecret("", false)
+	}
+	if _, environmentFileSet := os.LookupEnv("CLOAK_RECOVERY_SECRET_FILE"); environmentFileSet {
+		return acquireSecret("", false)
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return domain.RecoverySecret{}, errors.New("non-interactive Rekey requires a configured new Recovery Secret")
+	}
+	recoverySecret, mnemonic, err := secret.Generate()
+	if err != nil {
+		return domain.RecoverySecret{}, err
+	}
+	fmt.Fprintf(os.Stdout, "New Recovery Mnemonic (shown once): %s\nConfirm it is saved by typing SAVED: ", mnemonic)
+	confirmation, err := input.ReadString('\n')
+	if err != nil {
+		return domain.RecoverySecret{}, fmt.Errorf("read Recovery Mnemonic confirmation: %w", err)
+	}
+	if strings.TrimSpace(confirmation) != "SAVED" {
+		return domain.RecoverySecret{}, errors.New("new Recovery Mnemonic was not confirmed; Ciphertext Repository was not changed")
+	}
+	return recoverySecret, nil
 }
 
 func remoteAutoCompact(remoteName string) (bool, error) {
@@ -401,7 +515,7 @@ func acquireSecret(explicitFile string, allowGeneration bool) (domain.RecoverySe
 }
 
 func usageError() error {
-	return fmt.Errorf("usage: git-remote-cloak <init|clone|cache|doctor|set-head|status|version>")
+	return fmt.Errorf("usage: git-remote-cloak <init|clone|rekey|compact|cache|doctor|set-head|status|version>")
 }
 
 func absoluteGitDirectory() (string, error) {
