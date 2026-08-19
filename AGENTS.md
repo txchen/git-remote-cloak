@@ -1,5 +1,13 @@
 ## Agent skills
 
+### Development workflow
+
+For code, test, CI, release, or user-documentation changes, follow `docs/agents/development.md` through its completion criteria.
+
+### User configuration
+
+For installation, Git remote setup, Recovery Secret configuration, daily operations, or recovery behavior, use `docs/linux.md` as the source of truth.
+
 ### Issue tracker
 
 Issues and specs are tracked as local Markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
