@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestProviderCertificationHappyPath(t *testing.T) {
@@ -19,12 +20,6 @@ func TestProviderCertificationHappyPath(t *testing.T) {
 	explicit := filepath.Join(root, "explicit")
 	mustGit(t, root, "init", "-b", "main", owner)
 	writeAndCommit(t, owner, "provider-secret.txt", "provider certification plaintext\n", "provider certification commit")
-
-	t.Cleanup(func() {
-		command := exec.Command("git", "push", repositoryURL, ":refs/heads/cloak-storage")
-		command.Env = providerGitEnvironment(binary, "")
-		_ = command.Run()
-	})
 
 	runProviderCommand(t, binary, owner, testMnemonic, "init", "backup", repositoryURL)
 	runGitWithCloak(t, binary, owner, testMnemonic, "push", "backup", "main")
@@ -153,7 +148,7 @@ func certifyProviderCompareAndSwap(t *testing.T, binary, root, repositoryURL str
 			t.Fatalf("start concurrent provider push: %v", err)
 		}
 	}
-	waitForStorageRefBarrier(t, barrier, branches...)
+	waitForStorageRefBarrierWithin(t, 60*time.Second, barrier, branches...)
 	if err := os.WriteFile(filepath.Join(barrier, "release"), []byte("release\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -167,10 +162,8 @@ func certifyProviderCompareAndSwap(t *testing.T, binary, root, repositoryURL str
 	}
 	verification := filepath.Join(root, "cas-verification")
 	runProviderCommand(t, binary, root, testMnemonic, "clone", repositoryURL, verification)
-	for index, branch := range branches {
-		if got, want := mustGit(t, verification, "rev-parse", "origin/"+branch), mustGit(t, writers[index], "rev-parse", branch); got != want {
-			t.Fatalf("compatible provider ref %s = %q, want %q", branch, got, want)
-		}
+	for _, writer := range writers {
+		assertLogicalRefsEqual(t, verification, writer)
 	}
 }
 

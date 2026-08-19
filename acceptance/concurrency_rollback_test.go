@@ -113,8 +113,12 @@ func TestCompatibleConcurrentWritersRebuildAndPublishBothLogicalRefs(t *testing.
 }
 
 func waitForStorageRefBarrier(t *testing.T, directory string, participants ...string) {
+	waitForStorageRefBarrierWithin(t, 5*time.Second, directory, participants...)
+}
+
+func waitForStorageRefBarrierWithin(t *testing.T, timeout time.Duration, directory string, participants ...string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		allReady := true
 		for _, participant := range participants {
