@@ -28,7 +28,7 @@ jobs:
         run: scripts/build-release.sh "$GITHUB_REF_NAME" dist
       - name: Verify host artifact identity
         run: |
-          sha256sum --check dist/checksums.txt
+          (cd dist && sha256sum --check checksums.txt)
           tar -xzf "dist/git-remote-cloak_${GITHUB_REF_NAME}_linux_amd64.tar.gz" -C "$RUNNER_TEMP"
           "$RUNNER_TEMP/git-remote-cloak" version
           test "$("$RUNNER_TEMP/git-remote-cloak" version --json | jq -r .version)" = "$GITHUB_REF_NAME"

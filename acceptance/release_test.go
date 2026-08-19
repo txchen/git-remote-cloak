@@ -71,6 +71,16 @@ func TestReleaseBuilderProducesPinnedCGoFreeArtifactsAndChecksums(t *testing.T) 
 	}
 }
 
+func TestReleaseWorkflowVerifiesChecksumsFromArtifactDirectory(t *testing.T) {
+	workflow, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(workflow), "(cd dist && sha256sum --check checksums.txt)") {
+		t.Fatal("release workflow does not verify relative checksum entries from the artifact directory")
+	}
+}
+
 func readChecksums(t *testing.T, path string) map[string]string {
 	t.Helper()
 	file, err := os.Open(path)
