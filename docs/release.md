@@ -14,6 +14,8 @@ The Repository Host can observe the fixed Storage Ref, public format capabilitie
 
 A fresh clone can authenticate a Ciphertext Snapshot but cannot prove that it is the newest valid Ciphertext Snapshot. Known rollback is detected only after an Authorized Host has retained a trusted Rollback Checkpoint. Host availability, quotas, authentication, branch protection, history retention, and garbage collection remain provider concerns. Compaction, Rekey, deletion, and Format Migration cannot guarantee that a Repository Host erases superseded ciphertext or immediately returns quota.
 
+An Authorized Host whose Rollback Checkpoint predates a parentless Compaction may need the Repository Host to retain the authenticated prior Storage commits linked by that Compaction. If the host no longer provides a required commit, Cloak fails closed instead of discarding trusted rollback state.
+
 ## Cryptography and binary dependencies
 
 Format v1.0 uses AES-256-GCM-SIV through the pinned pure-Go Tink dependency, with key derivation from `golang.org/x/crypto`. The checksummed release binary is built with `CGO_ENABLED=0`, `-mod=readonly`, Go 1.26.5, and the module versions in `go.sum`. It does not require CGo, a native cryptographic library, a Python prototype, or another Cloak executable. It does require the standard `git` executable for Git plumbing and transport.

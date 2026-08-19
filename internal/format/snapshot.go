@@ -60,6 +60,14 @@ type DecodedSnapshot struct {
 	Packs      []PackPayload
 }
 
+// BootstrapState is the authenticated public continuity metadata carried by a Bootstrap Header.
+type BootstrapState struct {
+	Format             Format
+	RepositoryID       domain.RepositoryID
+	Generation         uint64
+	PreviousStorageRef string
+}
+
 // SnapshotInput describes one complete candidate Ciphertext Snapshot.
 type SnapshotInput struct {
 	Repository SnapshotState
@@ -353,45 +361,21 @@ func (r *Registry) DecodeSnapshotFrom(secret domain.RecoverySecret, bootstrap []
 }
 
 func (r *Registry) decodeSnapshotFrom(secret domain.RecoverySecret, bootstrap, headerBytes []byte, resolve func(string) ([]byte, error)) (DecodedSnapshot, error) {
-	var header snapshotBootstrapHeader
-	if err := r.decode.Unmarshal(headerBytes, &header); err != nil {
-		return DecodedSnapshot{}, fmt.Errorf("decode Bootstrap Header: %w", err)
-	}
-	canonical, err := r.encode.Marshal(header)
-	if err != nil || !bytes.Equal(canonical, headerBytes) {
-		return DecodedSnapshot{}, errors.New("Bootstrap Header is not canonical CBOR")
-	}
-	if len(header.RepositoryID) != 16 || header.Generation < 1 || header.FormatMajor != r.active.Major || header.FormatMinor != r.active.Minor || header.CryptographicSuite != CryptographicSuite || header.ChunkSize != DefaultChunkSize {
-		return DecodedSnapshot{}, errors.New("Bootstrap Header disagrees with supported v1 format")
-	}
-	var repositoryID domain.RepositoryID
-	copy(repositoryID[:], header.RepositoryID)
-	unsigned, err := r.encode.Marshal(snapshotUnsignedHeader{
-		RepositoryID: header.RepositoryID, FormatMajor: header.FormatMajor, FormatMinor: header.FormatMinor,
-		CryptographicSuite: header.CryptographicSuite, ChunkSize: header.ChunkSize, Generation: header.Generation,
-		ManifestLocator: header.ManifestLocator, PreviousStorageRef: header.PreviousStorageRef,
-	})
+	authenticated, manifestLocator, err := r.authenticateBootstrap(secret, bootstrap, headerBytes)
 	if err != nil {
 		return DecodedSnapshot{}, err
 	}
-	key, err := deriveKeyFor(r.active, secret, repositoryID, headerAuthenticationPurpose)
-	if err != nil {
-		return DecodedSnapshot{}, err
-	}
-	mac := hmac.New(sha256.New, key[:])
-	mac.Write(bootstrap[:preambleSize])
-	mac.Write(unsigned)
-	if !hmac.Equal(header.HeaderMAC, mac.Sum(nil)) {
-		return DecodedSnapshot{}, errors.New("Bootstrap Header authentication failed")
-	}
-	manifestCiphertext, err := resolve(header.ManifestLocator)
-	if err != nil || opaqueContentIdentifier(manifestCiphertext) != header.ManifestLocator {
+	manifestCiphertext, err := resolve(manifestLocator)
+	if err != nil || opaqueContentIdentifier(manifestCiphertext) != manifestLocator {
 		return DecodedSnapshot{}, errors.New("Encrypted Manifest is missing or has the wrong locator")
 	}
 	if len(manifestCiphertext) < 28 || len(manifestCiphertext)-28 > maximumManifestSize {
 		return DecodedSnapshot{}, errors.New("Encrypted Manifest exceeds the v1 size limit")
 	}
-	repository := SnapshotState{Format: r.active, RepositoryID: repositoryID, Generation: header.Generation, PreviousStorageRef: header.PreviousStorageRef}
+	repository := SnapshotState{
+		Format: authenticated.Format, RepositoryID: authenticated.RepositoryID, Generation: authenticated.Generation,
+		PreviousStorageRef: authenticated.PreviousStorageRef,
+	}
 	manifestPlaintext, err := r.decryptRecord(secret, repository, encryptedRecord{
 		generation: repository.Generation, purpose: manifestEncryptionPurpose, kind: manifestKind, final: true,
 	}, manifestCiphertext)
@@ -442,6 +426,54 @@ func (r *Registry) decodeSnapshotFrom(secret domain.RecoverySecret, bootstrap, h
 		return DecodedSnapshot{}, errors.New("non-empty Logical Repository has no Pack Payload")
 	}
 	return decoded, nil
+}
+
+// AuthenticateBootstrap verifies one Bootstrap Header without resolving its encrypted snapshot payload.
+func (r *Registry) AuthenticateBootstrap(secret domain.RecoverySecret, bootstrap []byte) (BootstrapState, error) {
+	format, headerBytes, err := r.probe(bootstrap)
+	if err != nil {
+		return BootstrapState{}, err
+	}
+	state, _, err := r.withFormat(format).authenticateBootstrap(secret, bootstrap, headerBytes)
+	return state, err
+}
+
+func (r *Registry) authenticateBootstrap(secret domain.RecoverySecret, bootstrap, headerBytes []byte) (BootstrapState, string, error) {
+	var header snapshotBootstrapHeader
+	if err := r.decode.Unmarshal(headerBytes, &header); err != nil {
+		return BootstrapState{}, "", fmt.Errorf("decode Bootstrap Header: %w", err)
+	}
+	canonical, err := r.encode.Marshal(header)
+	if err != nil || !bytes.Equal(canonical, headerBytes) {
+		return BootstrapState{}, "", errors.New("Bootstrap Header is not canonical CBOR")
+	}
+	if len(header.RepositoryID) != 16 || header.Generation < 1 || header.FormatMajor != r.active.Major || header.FormatMinor != r.active.Minor || header.CryptographicSuite != CryptographicSuite || header.ChunkSize != DefaultChunkSize {
+		return BootstrapState{}, "", errors.New("Bootstrap Header disagrees with supported v1 format")
+	}
+	var repositoryID domain.RepositoryID
+	copy(repositoryID[:], header.RepositoryID)
+	unsigned, err := r.encode.Marshal(snapshotUnsignedHeader{
+		RepositoryID: header.RepositoryID, FormatMajor: header.FormatMajor, FormatMinor: header.FormatMinor,
+		CryptographicSuite: header.CryptographicSuite, ChunkSize: header.ChunkSize, Generation: header.Generation,
+		ManifestLocator: header.ManifestLocator, PreviousStorageRef: header.PreviousStorageRef,
+	})
+	if err != nil {
+		return BootstrapState{}, "", err
+	}
+	key, err := deriveKeyFor(r.active, secret, repositoryID, headerAuthenticationPurpose)
+	if err != nil {
+		return BootstrapState{}, "", err
+	}
+	mac := hmac.New(sha256.New, key[:])
+	mac.Write(bootstrap[:preambleSize])
+	mac.Write(unsigned)
+	if !hmac.Equal(header.HeaderMAC, mac.Sum(nil)) {
+		return BootstrapState{}, "", errors.New("Bootstrap Header authentication failed")
+	}
+	return BootstrapState{
+		Format: r.active, RepositoryID: repositoryID, Generation: header.Generation,
+		PreviousStorageRef: header.PreviousStorageRef,
+	}, header.ManifestLocator, nil
 }
 
 func (r *Registry) decodePackPayload(secret domain.RecoverySecret, repository SnapshotState, location snapshotPayloadLocation, resolve func(string) ([]byte, error)) (PackPayload, error) {

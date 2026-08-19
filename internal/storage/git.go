@@ -180,11 +180,56 @@ func (transport *Git) ContainsStorageCommit(storageCommitID string) bool {
 	return err == nil
 }
 
+// FetchStorageCommit obtains one retained historical Storage commit by object ID without changing Storage Ref state.
+func (transport *Git) FetchStorageCommit(storageCommitID string) error {
+	if !validStorageCommitID(storageCommitID) {
+		return errors.New("invalid historical Storage commit ID")
+	}
+	if transport.ContainsStorageCommit(storageCommitID) {
+		return nil
+	}
+	if output, err := runGit(transport.path, nil, "fetch", "--no-tags", "origin", storageCommitID); err != nil {
+		return fmt.Errorf("fetch retained historical Storage commit: %s", strings.TrimSpace(string(output)))
+	}
+	if !transport.ContainsStorageCommit(storageCommitID) {
+		return errors.New("Repository Host did not return retained historical Storage commit")
+	}
+	return nil
+}
+
+// StorageHistoryRoot returns the unique parentless root reachable from one Storage History tip.
+func (transport *Git) StorageHistoryRoot(storageCommitID string) (string, error) {
+	if !validStorageCommitID(storageCommitID) {
+		return "", errors.New("invalid Storage History tip")
+	}
+	output, err := runGit(transport.path, nil, "rev-list", "--max-parents=0", storageCommitID)
+	if err != nil {
+		return "", fmt.Errorf("find Storage History root: %w", err)
+	}
+	roots := strings.Fields(string(output))
+	if len(roots) != 1 || !validStorageCommitID(roots[0]) {
+		return "", errors.New("Storage History does not have exactly one parentless root")
+	}
+	return roots[0], nil
+}
+
 // StorageHistoryContinues reports whether newerStorageCommitID descends from
 // the previously trusted Storage History commit.
 func (transport *Git) StorageHistoryContinues(previousStorageCommitID, newerStorageCommitID string) bool {
 	_, err := runGit(transport.path, nil, "merge-base", "--is-ancestor", previousStorageCommitID, newerStorageCommitID)
 	return err == nil
+}
+
+func validStorageCommitID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // PublishEmpty creates the initial Ciphertext Snapshot through ordinary Git transport.

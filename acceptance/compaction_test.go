@@ -113,6 +113,31 @@ func TestPushAutomaticallyCompactsAtAddedCiphertextThreshold(t *testing.T) {
 	}
 }
 
+func TestStaleCheckpointAcceptsAuthenticatedCompactionReRootChain(t *testing.T) {
+	binary := buildBinary(t)
+	root := t.TempDir()
+	owner := filepath.Join(root, "owner")
+	stale := filepath.Join(root, "stale")
+	host := filepath.Join(root, "host.git")
+	mustGit(t, root, "init", "--bare", host)
+	mustGit(t, root, "init", "-b", "main", owner)
+	writeAndCommit(t, owner, "first.md", strings.Repeat("# first\n\ninitial paragraph\n", 300), "first")
+	mustInit(t, binary, owner, host, testMnemonic)
+	mustGit(t, owner, "config", "remote.backup.cloakAutoCompact", "true")
+	mustCloakGit(t, binary, owner, "push", "backup", "main")
+	mustCloakGit(t, binary, root, "clone", "cloak::"+host, stale)
+
+	writeAndCommit(t, owner, "second.md", strings.Repeat("# second\n\nreplacement paragraph\n", 300), "second")
+	mustCloakGit(t, binary, owner, "push", "backup", "main")
+	writeAndCommit(t, owner, "third.md", "third publication after Compaction\n", "third")
+	mustCloakGit(t, binary, owner, "push", "backup", "main")
+
+	mustCloakGit(t, binary, stale, "fetch", "origin")
+	if got, want := strings.TrimSpace(mustGit(t, stale, "rev-parse", "origin/main")), strings.TrimSpace(mustGit(t, owner, "rev-parse", "main")); got != want {
+		t.Fatalf("stale Authorized Host fetched main %s, want %s", got, want)
+	}
+}
+
 func TestInterruptedCompactionLeavesPreviousStorageRefAuthoritative(t *testing.T) {
 	binary := buildBinary(t)
 	root := t.TempDir()

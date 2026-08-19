@@ -1199,7 +1199,8 @@ func (engine *Engine) decodeTransportSnapshotBytes(secret domain.RecoverySecret,
 		return cloakformat.DecodedSnapshot{}, err
 	}
 	if observe {
-		if err := localstate.ObserveCheckpoint(engine.localGitDirectory, decoded.Repository.RepositoryID, decoded.Repository.Generation, storageCommitID, decoded.Repository.PreviousStorageRef, transport.StorageHistoryContinues); err != nil {
+		continuity := engine.authenticatedStorageHistoryContinuity(secret, transport, decoded.Repository)
+		if err := localstate.ObserveCheckpoint(engine.localGitDirectory, decoded.Repository.RepositoryID, decoded.Repository.Generation, storageCommitID, decoded.Repository.PreviousStorageRef, continuity); err != nil {
 			return cloakformat.DecodedSnapshot{}, err
 		}
 	}
@@ -1207,6 +1208,44 @@ func (engine *Engine) decodeTransportSnapshotBytes(secret domain.RecoverySecret,
 	_ = cache.StoreSnapshot(storageCommitID, bootstrap, downloaded)
 	localstate.ReconcileTransactions(engine.localGitDirectory, secret, decoded.Repository.RepositoryID, storageCommitID, transport.ContainsStorageCommit)
 	return decoded, nil
+}
+
+func (engine *Engine) authenticatedStorageHistoryContinuity(secret domain.RecoverySecret, transport *storage.Git, current cloakformat.SnapshotState) func(string, string) bool {
+	return func(trustedStorageCommitID, currentStorageCommitID string) bool {
+		if transport.StorageHistoryContinues(trustedStorageCommitID, currentStorageCommitID) {
+			return true
+		}
+		seen := map[string]struct{}{currentStorageCommitID: {}}
+		segmentTip := currentStorageCommitID
+		maximumGeneration := current.Generation
+		for maximumGeneration > 1 {
+			rootStorageCommitID, err := transport.StorageHistoryRoot(segmentTip)
+			if err != nil {
+				return false
+			}
+			bootstrap, err := transport.ReadBootstrapAt(rootStorageCommitID)
+			if err != nil {
+				return false
+			}
+			root, err := engine.formats.AuthenticateBootstrap(secret, bootstrap)
+			if err != nil || root.RepositoryID != current.RepositoryID || root.Generation > maximumGeneration || root.Generation <= 1 || root.PreviousStorageRef == "" {
+				return false
+			}
+			if _, duplicate := seen[root.PreviousStorageRef]; duplicate {
+				return false
+			}
+			seen[root.PreviousStorageRef] = struct{}{}
+			if err := transport.FetchStorageCommit(root.PreviousStorageRef); err != nil {
+				return false
+			}
+			if transport.StorageHistoryContinues(trustedStorageCommitID, root.PreviousStorageRef) {
+				return true
+			}
+			segmentTip = root.PreviousStorageRef
+			maximumGeneration = root.Generation - 1
+		}
+		return false
+	}
 }
 
 func canonicalTransactionIntent(state gitdb.State) []byte {

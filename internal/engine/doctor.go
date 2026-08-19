@@ -140,8 +140,9 @@ func (engine *Engine) Doctor(repositoryURL string, secret domain.RecoverySecret)
 		return report, errors.New("doctor could not validate trusted Rollback Checkpoint")
 	}
 	if checkpointExists {
+		continuity := engine.authenticatedStorageHistoryContinuity(secret, transport, decoded.Repository)
 		if err := localstate.CheckCheckpoint(engine.localGitDirectory, decoded.Repository.RepositoryID, decoded.Repository.Generation,
-			storageCommitID, decoded.Repository.PreviousStorageRef, transport.StorageHistoryContinues); err != nil {
+			storageCommitID, decoded.Repository.PreviousStorageRef, continuity); err != nil {
 			failDoctorCheck(&report, doctorRollbackCheck, "Current authenticated snapshot contradicts trusted Rollback Checkpoint")
 			report.Freshness = "failed_trusted_checkpoint"
 			return report, errors.New("doctor found a suspected rollback")

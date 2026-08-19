@@ -83,6 +83,39 @@ func TestV1PackPayloadRoundTripsWithOpaqueAuthenticatedRecords(t *testing.T) {
 	}
 }
 
+func TestV1BootstrapContinuityMetadataAuthenticatesWithoutSnapshotPayload(t *testing.T) {
+	registry := cloakformat.NewRegistry()
+	previousStorageRef := strings.Repeat("a", 40)
+	encoded, err := registry.EncodeSnapshot(testSecret, cloakformat.SnapshotInput{
+		Repository: cloakformat.SnapshotState{
+			RepositoryID: testRepositoryID, Generation: 7, LogicalHEAD: "refs/heads/main",
+			ObjectFormat: "sha1", PreviousStorageRef: previousStorageRef,
+			LogicalRefs: map[string]string{"refs/heads/main": strings.Repeat("1", 40)},
+		},
+		Packs: []cloakformat.PackPayload{{Pack: []byte("PACK-bootstrap"), ObjectIDs: []string{strings.Repeat("1", 40)}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := registry.AuthenticateBootstrap(testSecret, encoded.Bootstrap)
+	if err != nil {
+		t.Fatalf("authenticate Bootstrap Header: %v", err)
+	}
+	if state.Format != cloakformat.V1 || state.RepositoryID != testRepositoryID || state.Generation != 7 || state.PreviousStorageRef != previousStorageRef {
+		t.Fatalf("authenticated Bootstrap state = %+v", state)
+	}
+	wrongSecret := testSecret
+	wrongSecret[0] ^= 1
+	if _, err := registry.AuthenticateBootstrap(wrongSecret, encoded.Bootstrap); err == nil {
+		t.Fatal("Bootstrap Header authenticated with the wrong Recovery Secret")
+	}
+	tampered := bytes.Clone(encoded.Bootstrap)
+	tampered[len(tampered)-1] ^= 1
+	if _, err := registry.AuthenticateBootstrap(testSecret, tampered); err == nil {
+		t.Fatal("tampered Bootstrap Header authenticated")
+	}
+}
+
 func TestV1SnapshotRejectsMissingCorruptedAndSubstitutedEncryptedObjects(t *testing.T) {
 	registry := cloakformat.NewRegistry()
 	input := cloakformat.SnapshotInput{
