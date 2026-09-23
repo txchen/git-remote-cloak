@@ -51,10 +51,10 @@ Cloak displays a Recovery Mnemonic once. Back up the complete `cloak-v1:` value 
 Push through the configured Cloak remote using ordinary Git:
 
 ```sh
-git push -u backup main
+git push -u backup master
 ```
 
-Replace `main` with the current local branch name when necessary. The branch must contain at least one commit before it can be pushed.
+Replace `master` with the current local branch name when necessary. The branch must contain at least one commit before it can be pushed.
 
 Recover on another authorized Linux host:
 
