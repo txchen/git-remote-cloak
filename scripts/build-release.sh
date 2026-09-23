@@ -50,11 +50,12 @@ for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
     "${source_epoch}" "${stage}/git-remote-cloak" "${output_directory}/${archive}"
 done
 
+cp "${repository_root}/install.sh" "${output_directory}/install.sh"
 (
   cd "${output_directory}"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum git-remote-cloak_*.tar.gz >checksums.txt
+    sha256sum git-remote-cloak_*.tar.gz install.sh >checksums.txt
   else
-    shasum -a 256 git-remote-cloak_*.tar.gz >checksums.txt
+    shasum -a 256 git-remote-cloak_*.tar.gz install.sh >checksums.txt
   fi
 )

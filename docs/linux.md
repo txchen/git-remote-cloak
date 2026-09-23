@@ -21,7 +21,7 @@ The repository must have no refs. A README, license, or provider-created initial
 
 ## Install and verify
 
-Follow the [README installation steps](../README.md#install-on-linux). Keep the binary on `PATH`; Git locates it by the required name `git-remote-cloak` when a `cloak::` remote is used.
+Follow the [one-command installation steps](../README.md#install). Keep the binary on `PATH`; Git locates it by the required name `git-remote-cloak` when a `cloak::` remote is used.
 
 Verify the exact binary before configuring a repository:
 
@@ -30,7 +30,24 @@ git-remote-cloak version --json
 git-remote-cloak version --formats
 ```
 
-For release `v0.1.0`, expect Linux amd64, CGo disabled, and exact read/write support for format v1.0.
+For release `v0.1.1`, expect Linux amd64, CGo disabled, and exact read/write support for format v1.0.
+
+### Manual installation
+
+The installer is optional. To install Linux x86-64 manually, download into a fresh
+directory, verify the archive, and put the executable on `PATH`:
+
+```sh
+version=v0.1.1
+curl -fLO "https://github.com/txchen/git-remote-cloak/releases/download/${version}/checksums.txt"
+curl -fLO "https://github.com/txchen/git-remote-cloak/releases/download/${version}/git-remote-cloak_${version}_linux_amd64.tar.gz"
+sha256sum --check --ignore-missing checksums.txt
+tar -xzf "git-remote-cloak_${version}_linux_amd64.tar.gz"
+mkdir -p "$HOME/.local/bin"
+install -m 755 git-remote-cloak "$HOME/.local/bin/git-remote-cloak"
+export PATH="$HOME/.local/bin:$PATH"
+git-remote-cloak version
+```
 
 ## Initialize a backup
 
@@ -135,7 +152,14 @@ git-remote-cloak cache clear
 
 ## Upgrade
 
-Download and verify the new release, replace the executable atomically, then check its exact capabilities:
+Re-run the installer to download, verify, and atomically install the latest release:
+
+```sh
+curl -fsSL https://github.com/txchen/git-remote-cloak/releases/latest/download/install.sh | bash
+git-remote-cloak version
+```
+
+For a manual upgrade, download and verify the new release, then replace the executable atomically:
 
 ```sh
 install -m 755 git-remote-cloak "$HOME/.local/bin/git-remote-cloak.new"

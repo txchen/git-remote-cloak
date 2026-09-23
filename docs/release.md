@@ -40,6 +40,19 @@ The accepted `v0.1.0` release gate is:
 
 Broader GitHub/GitLab × SSH/HTTPS certification remains available through the [provider certification runbook](provider-certification.md), but is outside the current `v0.1.0` support claim.
 
+## v0.1.1 changes
+
+Version `v0.1.1` fixes local HEAD changes during helper operations, Rollback
+Checkpoint bypass in empty workspaces, and concurrent checkpoint regression.
+Push sources now accept Git revisions, including detached `HEAD`, and remote
+names may match CLI subcommands. Git subprocess repository-path isolation is
+shared across storage and logical operations.
+
+Each release also includes `install.sh` in `checksums.txt`. The installer selects
+Linux/macOS amd64/arm64 archives and installs or upgrades without Go or sudo.
+Ciphertext Repository format remains v1.0. These changes do not broaden the
+manual provider-certification claim recorded for v0.1.0 above.
+
 ## Published release evidence
 
 - [v0.1.0 release](https://github.com/txchen/git-remote-cloak/releases/tag/v0.1.0)

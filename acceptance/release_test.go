@@ -26,17 +26,18 @@ func TestReleaseBuilderProducesPinnedCGoFreeArtifactsAndChecksums(t *testing.T) 
 		t.Fatalf("build release: %v\n%s", err, output)
 	}
 
-	wantArchives := []string{
+	wantAssets := []string{
 		"git-remote-cloak_v1.2.3_darwin_amd64.tar.gz",
 		"git-remote-cloak_v1.2.3_darwin_arm64.tar.gz",
 		"git-remote-cloak_v1.2.3_linux_amd64.tar.gz",
 		"git-remote-cloak_v1.2.3_linux_arm64.tar.gz",
+		"install.sh",
 	}
 	checksums := readChecksums(t, filepath.Join(destination, "checksums.txt"))
-	if len(checksums) != len(wantArchives) {
-		t.Fatalf("checksum count = %d, want %d", len(checksums), len(wantArchives))
+	if len(checksums) != len(wantAssets) {
+		t.Fatalf("checksum count = %d, want %d", len(checksums), len(wantAssets))
 	}
-	for _, name := range wantArchives {
+	for _, name := range wantAssets {
 		archive := filepath.Join(destination, name)
 		contents, err := os.ReadFile(archive)
 		if err != nil {

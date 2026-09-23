@@ -2,25 +2,39 @@
 
 `git-remote-cloak` stores a private Git backup on an ordinary Repository Host without exposing original files, paths, commit messages, or branch names. The owner works in a normal Git repository; the host sees one `cloak-storage` branch containing opaque ciphertext.
 
-Binary version `v0.1.0` writes Ciphertext Repository format `v1.0`. These versions are independent. The current operationally verified target is Linux amd64.
+Binary version `v0.1.1` writes Ciphertext Repository format `v1.0`. These versions are independent. The current operationally verified target is Linux amd64.
 
-## Install on Linux
+## Install
 
-Download `checksums.txt` and the archive matching your machine from the [latest release](https://github.com/txchen/git-remote-cloak/releases/latest). For Linux x86-64:
+On Linux or macOS (x86-64 or ARM64), with Git, Bash, curl, and tar available:
 
 ```sh
-version=v0.1.0
-curl -fLO "https://github.com/txchen/git-remote-cloak/releases/download/${version}/checksums.txt"
-curl -fLO "https://github.com/txchen/git-remote-cloak/releases/download/${version}/git-remote-cloak_${version}_linux_amd64.tar.gz"
-sha256sum --check --ignore-missing checksums.txt
-tar -xzf "git-remote-cloak_${version}_linux_amd64.tar.gz"
-install -m 700 -d "$HOME/.local/bin"
-install -m 755 git-remote-cloak "$HOME/.local/bin/git-remote-cloak"
+curl -fsSL https://github.com/txchen/git-remote-cloak/releases/latest/download/install.sh | bash
+```
+
+The installer selects the latest release for your machine, verifies its SHA-256
+checksum, and installs it to `$HOME/.local/bin` without sudo. Running it again
+upgrades the binary atomically. A failed download or checksum check preserves the
+existing installation. Linux amd64 remains the operationally verified target;
+other published platforms have the support limits described in [the release contract](docs/release.md).
+
+If that directory is not already on your `PATH`, add this to your shell
+configuration (`~/.bashrc` or `~/.zshrc`) and run it in the current terminal:
+
+```sh
 export PATH="$HOME/.local/bin:$PATH"
 git-remote-cloak version
 ```
 
-Persist `$HOME/.local/bin` in the shell's `PATH`. The version output must report `v0.1.0`, `linux/amd64`, `cgo: disabled`, and `v1.0 read=yes write=yes`.
+Choose a version or an existing writable installation directory when needed:
+
+```sh
+curl -fsSL https://github.com/txchen/git-remote-cloak/releases/latest/download/install.sh \
+  | CLOAK_VERSION=v0.1.1 CLOAK_INSTALL_DIR="$HOME/.local/bin" bash
+```
+
+To inspect the script first, download it to a file and run `bash install.sh` after
+reviewing it. Archives and `checksums.txt` remain available for [manual installation](docs/linux.md#manual-installation).
 
 ## Quick start
 
