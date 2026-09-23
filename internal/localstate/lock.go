@@ -19,6 +19,16 @@ type OperationLock struct {
 // AcquireOperationLock obtains the Logical Repository's non-blocking local
 // operation lock.
 func AcquireOperationLock(gitDirectory string) (*OperationLock, error) {
+	return acquireLock(gitDirectory, "operation.lock", unix.LOCK_EX|unix.LOCK_NB)
+}
+
+// Checkpoint writers serialize across processes, independently of the longer
+// publication lock. Readers such as fetch and inspect also advance this state.
+func acquireCheckpointLock(gitDirectory string) (*OperationLock, error) {
+	return acquireLock(gitDirectory, "checkpoint.lock", unix.LOCK_EX)
+}
+
+func acquireLock(gitDirectory, name string, flags int) (*OperationLock, error) {
 	if gitDirectory == "" {
 		return &OperationLock{}, nil
 	}
@@ -29,16 +39,22 @@ func AcquireOperationLock(gitDirectory string) (*OperationLock, error) {
 	if err := os.Chmod(directory, 0o700); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(filepath.Join(directory, "operation.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := os.OpenFile(filepath.Join(directory, name), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("open local operation lock: %w", err)
+		return nil, fmt.Errorf("open local %s: %w", name, err)
 	}
-	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+	for {
+		err = unix.Flock(int(file.Fd()), flags)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	if err != nil {
 		_ = file.Close()
 		if errors.Is(err, unix.EWOULDBLOCK) {
 			return nil, errors.New("another Cloak publication or maintenance operation is already using this Logical Repository")
 		}
-		return nil, fmt.Errorf("acquire local operation lock: %w", err)
+		return nil, fmt.Errorf("acquire local %s: %w", name, err)
 	}
 	return &OperationLock{file: file}, nil
 }

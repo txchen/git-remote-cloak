@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/txchen/git-remote-cloak/internal/gitexec"
 )
 
 // Git is the production Storage Transport adapter for local, SSH, and HTTPS Repository Hosts.
@@ -37,7 +39,7 @@ func OpenGit(repositoryURL string) (*Git, error) {
 	}
 	gitDirectory := filepath.Join(temporaryRoot, "repository.git")
 	command := exec.Command("git", "clone", "--bare", "--no-checkout", "--filter=blob:none", repositoryURL, gitDirectory)
-	command.Env = append(cleanStorageEnvironment(os.Environ()), "GIT_CONFIG_NOSYSTEM=1")
+	command.Env = gitexec.Environment(os.Environ())
 	if output, err := command.CombinedOutput(); err != nil {
 		_ = os.RemoveAll(temporaryRoot)
 		return nil, fmt.Errorf("open Repository Host through ordinary Git transport: %s", strings.TrimSpace(string(output)))
@@ -236,17 +238,6 @@ func validStorageCommitID(value string) bool {
 func (transport *Git) PublishEmpty(bootstrap, manifest []byte, locator string) error {
 	_, err := transport.PublishSnapshot(transport.zeroObject, bootstrap, map[string][]byte{locator: manifest})
 	return err
-}
-
-func cleanStorageEnvironment(environment []string) []string {
-	clean := make([]string, 0, len(environment))
-	for _, entry := range environment {
-		name, _, _ := strings.Cut(entry, "=")
-		if name != "GIT_DIR" && name != "GIT_WORK_TREE" && name != "GIT_INDEX_FILE" && name != "GIT_OBJECT_DIRECTORY" && name != "GIT_ALTERNATE_OBJECT_DIRECTORIES" {
-			clean = append(clean, entry)
-		}
-	}
-	return clean
 }
 
 func nonRetryablePushError(message string) bool {

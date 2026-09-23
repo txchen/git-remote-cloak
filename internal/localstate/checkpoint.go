@@ -49,10 +49,15 @@ func ObserveCheckpoint(gitDirectory string, repositoryID domain.RepositoryID, ge
 	if gitDirectory == "" {
 		return nil
 	}
+	lock, err := acquireCheckpointLock(gitDirectory)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	if err := CheckCheckpoint(gitDirectory, repositoryID, generation, storageCommitID, previousStorageCommitID, storageHistoryContinues); err != nil {
 		return err
 	}
-	return StoreCheckpoint(gitDirectory, Checkpoint{
+	return storeCheckpoint(gitDirectory, Checkpoint{
 		Version: checkpointVersion, RepositoryID: hex.EncodeToString(repositoryID[:]),
 		HighestAuthenticatedGeneration: generation, LastSeenStorageCommitID: storageCommitID,
 	})
@@ -88,8 +93,9 @@ func CheckCheckpoint(gitDirectory string, repositoryID domain.RepositoryID, gene
 	return nil
 }
 
-// StoreCheckpoint atomically writes public trusted rollback state.
-func StoreCheckpoint(gitDirectory string, checkpoint Checkpoint) error {
+// storeCheckpoint atomically writes public trusted rollback state. The caller
+// must hold the checkpoint lock across validation and this write.
+func storeCheckpoint(gitDirectory string, checkpoint Checkpoint) error {
 	if gitDirectory == "" || !validCheckpoint(checkpoint) {
 		return errors.New("invalid Rollback Checkpoint")
 	}
@@ -103,7 +109,12 @@ func StoreCheckpoint(gitDirectory string, checkpoint Checkpoint) error {
 // ReplaceCheckpoint installs trusted state for a deliberately confirmed new
 // Ciphertext Repository identity, such as a successful Rekey publication.
 func ReplaceCheckpoint(gitDirectory string, repositoryID domain.RepositoryID, generation uint64, storageCommitID string) error {
-	return StoreCheckpoint(gitDirectory, Checkpoint{
+	lock, err := acquireCheckpointLock(gitDirectory)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	return storeCheckpoint(gitDirectory, Checkpoint{
 		Version: checkpointVersion, RepositoryID: hex.EncodeToString(repositoryID[:]),
 		HighestAuthenticatedGeneration: generation, LastSeenStorageCommitID: storageCommitID,
 	})

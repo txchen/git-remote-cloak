@@ -16,6 +16,7 @@ import (
 	"github.com/txchen/git-remote-cloak/internal/domain"
 	cloakformat "github.com/txchen/git-remote-cloak/internal/format"
 	"github.com/txchen/git-remote-cloak/internal/gitdb"
+	"github.com/txchen/git-remote-cloak/internal/gitexec"
 	"github.com/txchen/git-remote-cloak/internal/localstate"
 	"github.com/txchen/git-remote-cloak/internal/storage"
 )
@@ -988,7 +989,7 @@ func (engine *Engine) FetchInto(repositoryURL, gitDirectory string, secret domai
 
 // RefUpdate is one requested Logical Ref change in an atomic push transaction.
 type RefUpdate struct {
-	Source         domain.LogicalRefName
+	Source         string // Git revision expression; empty for deletion.
 	Destination    domain.LogicalRefName
 	Force          bool
 	ExpectedOld    string
@@ -998,7 +999,7 @@ type RefUpdate struct {
 // PublishRef applies one direct remote-helper ref update.
 func (engine *Engine) PublishRef(repositoryURL, sourceGitDirectory, sourceRef, destinationRef string, force bool, secret domain.RecoverySecret) error {
 	return engine.PublishRefs(repositoryURL, sourceGitDirectory, []RefUpdate{{
-		Source: domain.LogicalRefName(sourceRef), Destination: domain.LogicalRefName(destinationRef), Force: force,
+		Source: sourceRef, Destination: domain.LogicalRefName(destinationRef), Force: force,
 	}}, secret)
 }
 
@@ -1024,6 +1025,22 @@ func (engine *Engine) PublishRefsWithOptions(repositoryURL, sourceGitDirectory s
 		return err
 	}
 	defer operationLock.Close()
+
+	// Pin each source once so a concurrent local ref change cannot alter the
+	// transaction when a Storage Ref compare-and-swap has to be retried.
+	updates = append([]RefUpdate(nil), updates...)
+	for index := range updates {
+		if !updates[index].Destination.IsSupported() {
+			return errors.New("push requires branch or tag destination refs")
+		}
+		if updates[index].Source != "" {
+			objectID, err := gitdb.ResolveObjectID(sourceGitDirectory, updates[index].Source)
+			if err != nil {
+				return err
+			}
+			updates[index].Source = objectID
+		}
+	}
 
 	var concurrentErr error
 	for attempt := 1; attempt <= 3; attempt++ {
@@ -1067,10 +1084,7 @@ func (engine *Engine) publishRefAttempt(repositoryURL, sourceGitDirectory string
 		}
 	}
 	for _, update := range updates {
-		source, destination := string(update.Source), string(update.Destination)
-		if !update.Destination.IsSupported() || source != "" && !strings.HasPrefix(source, "refs/") {
-			return errors.New("push requires branch or tag refs")
-		}
+		source, destination := update.Source, string(update.Destination)
 		if update.HasExpectedOld && current.Repository.LogicalRefs[destination] != update.ExpectedOld {
 			return fmt.Errorf("stale force-with-lease for Logical Ref %s", destination)
 		}
@@ -1085,7 +1099,7 @@ func (engine *Engine) publishRefAttempt(repositoryURL, sourceGitDirectory string
 			refspec = "+" + refspec
 		}
 		command := exec.Command("git", "--git-dir="+temporary, "fetch", "--no-tags", sourceGitDirectory, refspec)
-		command.Env = append(cleanGitEnvironment(os.Environ()), "GIT_CONFIG_NOSYSTEM=1")
+		command.Env = gitexec.Environment(os.Environ())
 		if output, err := command.CombinedOutput(); err != nil {
 			return fmt.Errorf("receive pushed Logical Ref: %s", strings.TrimSpace(string(output)))
 		}
@@ -1295,6 +1309,7 @@ func recordRecoveredCheckpoint(repositoryDirectory string, decoded authenticated
 func makeEmptyBare(destination string, repository cloakformat.SnapshotState) (string, error) {
 	branch := strings.TrimPrefix(string(repository.LogicalHEAD), "refs/heads/")
 	command := exec.Command("git", "init", "--bare", "--object-format="+repository.ObjectFormat, "-b", branch, destination)
+	command.Env = gitexec.Environment(os.Environ())
 	if output, err := command.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("initialize empty Logical Repository: %s", strings.TrimSpace(string(output)))
 	}
@@ -1317,7 +1332,7 @@ func validStorageCommitID(value string) bool {
 func git(directory string, stdin []byte, arguments ...string) ([]byte, error) {
 	command := exec.Command("git", arguments...)
 	command.Dir = directory
-	command.Env = append(cleanGitEnvironment(os.Environ()), "GIT_CONFIG_NOSYSTEM=1")
+	command.Env = gitexec.Environment(os.Environ())
 	if stdin != nil {
 		command.Stdin = strings.NewReader(string(stdin))
 	}
@@ -1329,22 +1344,4 @@ func git(directory string, stdin []byte, arguments ...string) ([]byte, error) {
 		return nil, err
 	}
 	return output, nil
-}
-
-func cleanGitEnvironment(environment []string) []string {
-	blocked := map[string]struct{}{
-		"GIT_DIR":                          {},
-		"GIT_WORK_TREE":                    {},
-		"GIT_INDEX_FILE":                   {},
-		"GIT_OBJECT_DIRECTORY":             {},
-		"GIT_ALTERNATE_OBJECT_DIRECTORIES": {},
-	}
-	clean := make([]string, 0, len(environment))
-	for _, entry := range environment {
-		name, _, _ := strings.Cut(entry, "=")
-		if _, found := blocked[name]; !found {
-			clean = append(clean, entry)
-		}
-	}
-	return clean
 }

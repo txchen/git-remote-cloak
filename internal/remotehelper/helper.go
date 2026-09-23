@@ -36,15 +36,10 @@ func RunWithOptions(repositoryURL string, recoverySecret domain.RecoverySecret, 
 		if err := gitdb.RejectPromisorState(gitDirectory); err != nil {
 			return err
 		}
-		if !isGitCloneScaffold(gitDirectory) {
-			repositoryEngine = engine.NewWithLocalState(gitDirectory)
-		}
+		repositoryEngine = engine.NewWithLocalState(gitDirectory)
 	}
 	repository, err := repositoryEngine.Inspect(repositoryURL, recoverySecret)
 	if err != nil {
-		return err
-	}
-	if err := restoreMissingLogicalHEAD(repository.LogicalHEAD); err != nil {
 		return err
 	}
 	reader := bufio.NewScanner(input)
@@ -157,9 +152,6 @@ func RunWithOptions(repositoryURL string, recoverySecret domain.RecoverySecret, 
 					return err
 				}
 			}
-			if err := restoreLogicalHEAD(repository.LogicalHEAD); err != nil {
-				return err
-			}
 			if _, err := fmt.Fprint(writer, "\n"); err != nil {
 				return err
 			}
@@ -186,7 +178,7 @@ func RunWithOptions(repositoryURL string, recoverySecret domain.RecoverySecret, 
 			return writer.Flush()
 		case command == "":
 			if cloning && len(repository.LogicalRefs) == 0 {
-				if err := atomicallyRecoverGitClone(repositoryEngine, repositoryURL, recoverySecret); err != nil {
+				if err := atomicallyRecoverGitClone(repositoryURL, recoverySecret); err != nil {
 					return err
 				}
 			}
@@ -196,7 +188,7 @@ func RunWithOptions(repositoryURL string, recoverySecret domain.RecoverySecret, 
 				return errors.New("partial clone filters and promisor objects are unsupported")
 			}
 			if cloning && !cloneRecovered && len(repository.LogicalRefs) != 0 {
-				if err := atomicallyRecoverGitClone(repositoryEngine, repositoryURL, recoverySecret); err != nil {
+				if err := atomicallyRecoverGitClone(repositoryURL, recoverySecret); err != nil {
 					return err
 				}
 				cloneRecovered = true
@@ -228,17 +220,9 @@ func RunWithOptions(repositoryURL string, recoverySecret domain.RecoverySecret, 
 		return err
 	}
 	if cloning && len(repository.LogicalRefs) == 0 {
-		return atomicallyRecoverGitClone(repositoryEngine, repositoryURL, recoverySecret)
+		return atomicallyRecoverGitClone(repositoryURL, recoverySecret)
 	}
 	return nil
-}
-
-func isGitCloneScaffold(gitDirectory string) bool {
-	if filepath.Base(gitDirectory) != ".git" {
-		return false
-	}
-	entries, err := os.ReadDir(filepath.Dir(gitDirectory))
-	return err == nil && len(entries) == 1 && entries[0].Name() == ".git" && entries[0].IsDir()
 }
 
 func secureEmptyGitCloneScaffold() error {
@@ -271,7 +255,7 @@ func parseRefUpdate(refspec string) (engine.RefUpdate, error) {
 	}
 	var found bool
 	source, destination, found := strings.Cut(refspec, ":")
-	push.Source = domain.LogicalRefName(source)
+	push.Source = source
 	push.Destination = domain.LogicalRefName(destination)
 	if !found || push.Destination == "" {
 		return engine.RefUpdate{}, errors.New("push refspec requires a destination")
@@ -299,7 +283,7 @@ func singleLine(message string) string {
 	return strings.Join(strings.Fields(message), " ")
 }
 
-func atomicallyRecoverGitClone(repositoryEngine *engine.Engine, repositoryURL string, recoverySecret domain.RecoverySecret) error {
+func atomicallyRecoverGitClone(repositoryURL string, recoverySecret domain.RecoverySecret) error {
 	gitDirectory, explicitlySet := os.LookupEnv("GIT_DIR")
 	if !explicitlySet {
 		return nil
@@ -336,29 +320,15 @@ func atomicallyRecoverGitClone(repositoryEngine *engine.Engine, repositoryURL st
 			_ = os.Rename(scaffold, destination)
 		}
 	}()
+	// Keep observing the checkpoint at its relocated path until publication.
+	// Reusing the old path would recreate the destination during recovery.
+	repositoryEngine := engine.NewWithLocalState(filepath.Join(scaffold, ".git"))
 	if err := repositoryEngine.RecoverForGitClone(repositoryURL, destination, recoverySecret); err != nil {
 		return err
 	}
 	restoreScaffold = false
 	if err := os.RemoveAll(scaffold); err != nil {
 		return fmt.Errorf("remove replaced Git clone scaffold: %w", err)
-	}
-	return nil
-}
-
-func restoreMissingLogicalHEAD(logicalHEAD domain.LogicalHEAD) error {
-	probe := exec.Command("git", "symbolic-ref", "-q", "HEAD")
-	probe.Stderr = io.Discard
-	if err := probe.Run(); err == nil {
-		return nil
-	}
-	return restoreLogicalHEAD(logicalHEAD)
-}
-
-func restoreLogicalHEAD(logicalHEAD domain.LogicalHEAD) error {
-	command := exec.Command("git", "symbolic-ref", "HEAD", string(logicalHEAD))
-	if output, err := command.CombinedOutput(); err != nil {
-		return fmt.Errorf("restore Logical HEAD: %s", strings.TrimSpace(string(output)))
 	}
 	return nil
 }

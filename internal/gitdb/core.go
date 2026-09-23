@@ -13,6 +13,7 @@ import (
 
 	"github.com/txchen/git-remote-cloak/internal/domain"
 	cloakformat "github.com/txchen/git-remote-cloak/internal/format"
+	"github.com/txchen/git-remote-cloak/internal/gitexec"
 )
 
 // State is the Logical Repository state authenticated by an Encrypted Manifest.
@@ -20,6 +21,16 @@ type State struct {
 	LogicalHEAD  domain.LogicalHEAD
 	ObjectFormat string
 	LogicalRefs  map[string]string
+}
+
+// ResolveObjectID pins a push source revision without peeling annotated tags.
+// --end-of-options prevents a revision from being interpreted as a Git option.
+func ResolveObjectID(gitDirectory, revision string) (string, error) {
+	output, err := run(gitDirectory, nil, "rev-parse", "--verify", "--end-of-options", revision+"^{object}")
+	if err != nil {
+		return "", fmt.Errorf("resolve push source: %w", err)
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 // ReadState reads the branches and tags from a bare Logical Repository.
@@ -330,7 +341,7 @@ func initializeAndImport(destination string, bare bool, state State, packs []clo
 	}
 	arguments = append(arguments, "-b", strings.TrimPrefix(string(state.LogicalHEAD), "refs/heads/"), destination)
 	initialize := exec.Command("git", arguments...)
-	initialize.Env = cleanEnvironment()
+	initialize.Env = gitexec.Environment(os.Environ())
 	if output, err := initialize.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("initialize Recovered Repository: %s", strings.TrimSpace(string(output)))
 	}
@@ -347,7 +358,7 @@ func initializeAndImport(destination string, bare bool, state State, packs []clo
 func runWorkTree(workTree string, arguments ...string) ([]byte, error) {
 	fullArguments := append([]string{"--git-dir=" + destinationGitDirectory(workTree, false), "--work-tree=" + workTree}, arguments...)
 	command := exec.Command("git", fullArguments...)
-	command.Env = cleanEnvironment()
+	command.Env = gitexec.Environment(os.Environ())
 	output, err := command.Output()
 	if err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
@@ -417,7 +428,7 @@ func runOptional(gitDirectory string, arguments ...string) ([]byte, bool, error)
 func runWithOptions(gitDirectory string, stdin []byte, options gitRunOptions, arguments ...string) ([]byte, bool, error) {
 	fullArguments := append([]string{"--git-dir=" + gitDirectory}, arguments...)
 	command := exec.Command("git", fullArguments...)
-	command.Env = append(cleanEnvironment(), options.additionalEnvironment...)
+	command.Env = append(gitexec.Environment(os.Environ()), options.additionalEnvironment...)
 	if stdin != nil {
 		command.Stdin = bytes.NewReader(stdin)
 	}
@@ -432,15 +443,4 @@ func runWithOptions(gitDirectory string, stdin []byte, options gitRunOptions, ar
 		return nil, false, fmt.Errorf("git %s: %s", strings.Join(arguments, " "), strings.TrimSpace(string(exitError.Stderr)))
 	}
 	return nil, false, err
-}
-
-func cleanEnvironment() []string {
-	environment := make([]string, 0, len(os.Environ())+1)
-	for _, entry := range os.Environ() {
-		name, _, _ := strings.Cut(entry, "=")
-		if name != "GIT_DIR" && name != "GIT_WORK_TREE" && name != "GIT_INDEX_FILE" && name != "GIT_OBJECT_DIRECTORY" && name != "GIT_ALTERNATE_OBJECT_DIRECTORIES" {
-			environment = append(environment, entry)
-		}
-	}
-	return append(environment, "GIT_CONFIG_NOSYSTEM=1")
 }

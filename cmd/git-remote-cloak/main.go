@@ -37,6 +37,9 @@ func run(arguments []string) error {
 	if len(arguments) == 0 {
 		return usageError()
 	}
+	if isConfiguredHelperInvocation(arguments) {
+		return runRemoteHelper(arguments)
+	}
 	switch arguments[0] {
 	case "version":
 		return runVersion(arguments[1:])
@@ -60,21 +63,51 @@ func run(arguments []string) error {
 		return runMigrate(arguments[1:])
 	default:
 		if len(arguments) == 2 {
-			recoverySecret, err := acquireSecret("", false)
-			if err != nil {
-				return err
-			}
-			autoCompact, err := remoteAutoCompact(arguments[0])
-			if err != nil {
-				return err
-			}
-			return remotehelper.RunWithOptions(arguments[1], recoverySecret, os.Stdin, os.Stdout, engine.PublishOptions{
-				AutoCompact: autoCompact,
-				Progress:    func(message string) { fmt.Fprintln(os.Stderr, message) },
-			})
+			return runRemoteHelper(arguments)
 		}
 		return usageError()
 	}
+}
+
+// Git supplies GIT_DIR and the configured remote name/transport URL to helpers.
+// Match both URLs so fetch and a separately configured push URL can use remote
+// names that also happen to be human-facing subcommands.
+func isConfiguredHelperInvocation(arguments []string) bool {
+	if len(arguments) != 2 || os.Getenv("GIT_DIR") == "" {
+		return false
+	}
+	for _, push := range []bool{false, true} {
+		args := []string{"remote", "get-url", "--all"}
+		if push {
+			args = append(args, "--push")
+		}
+		args = append(args, "--", arguments[0])
+		output, err := exec.Command("git", args...).Output()
+		if err != nil {
+			continue
+		}
+		for _, configured := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+			if configured == "cloak::"+arguments[1] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func runRemoteHelper(arguments []string) error {
+	recoverySecret, err := acquireSecret("", false)
+	if err != nil {
+		return err
+	}
+	autoCompact, err := remoteAutoCompact(arguments[0])
+	if err != nil {
+		return err
+	}
+	return remotehelper.RunWithOptions(arguments[1], recoverySecret, os.Stdin, os.Stdout, engine.PublishOptions{
+		AutoCompact: autoCompact,
+		Progress:    func(message string) { fmt.Fprintln(os.Stderr, message) },
+	})
 }
 
 func runMigrate(arguments []string) error {

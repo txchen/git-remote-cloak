@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/txchen/git-remote-cloak/internal/gitexec"
 )
 
 const StorageRef = "refs/heads/cloak-storage"
@@ -268,8 +270,7 @@ func (transport *LocalBare) writeBlob(contents []byte) (string, error) {
 func runGit(gitDirectory string, stdin []byte, arguments ...string) ([]byte, error) {
 	fullArguments := append([]string{"--git-dir=" + gitDirectory}, arguments...)
 	command := exec.Command("git", fullArguments...)
-	command.Env = append(os.Environ(),
-		"GIT_CONFIG_NOSYSTEM=1",
+	command.Env = append(gitexec.Environment(os.Environ()),
 		"GIT_AUTHOR_NAME=git-remote-cloak",
 		"GIT_AUTHOR_EMAIL=cloak@invalid",
 		"GIT_COMMITTER_NAME=git-remote-cloak",
