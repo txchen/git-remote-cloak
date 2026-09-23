@@ -115,6 +115,16 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 	if _, err := git(workspace, nil, "rev-parse", "--git-dir"); err != nil {
 		return errors.New("init must run inside a Git repository")
 	}
+	gitDirectoryOutput, err := git(workspace, nil, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return err
+	}
+	secretGitDirectory := strings.TrimSpace(string(gitDirectoryOutput))
+	secretLock, err := localstate.AcquireSecretLock(secretGitDirectory)
+	if err != nil {
+		return err
+	}
+	defer secretLock.Close()
 	logicalHEAD, err := git(workspace, nil, "symbolic-ref", "HEAD")
 	if err != nil {
 		if defaultBranch == "" {
@@ -137,6 +147,18 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 	}
 	configuredRepositoryID, repositoryIDErr := git(workspace, nil, "config", "--get", "remote."+remoteName+".cloakRepositoryID")
 	hasConfiguredRepositoryID := repositoryIDErr == nil
+	// Older recovered checkouts have a trusted checkpoint but no public
+	// remote identity field. It is sufficient to bind an in-place upgrade.
+	if configuredErr == nil && !hasConfiguredRepositoryID {
+		checkpoint, exists, err := localstate.LoadCheckpoint(secretGitDirectory)
+		if err != nil {
+			return err
+		}
+		if exists {
+			configuredRepositoryID = []byte(checkpoint.RepositoryID)
+			hasConfiguredRepositoryID = true
+		}
+	}
 	transport, err := storage.OpenGit(repositoryURL)
 	if err != nil {
 		return err
@@ -174,6 +196,10 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 		if err != nil {
 			return err
 		}
+		// Persist before publication: a lost response must never lose the key.
+		if err := localstate.EnsureRecoverySecret(secretGitDirectory, secret); err != nil {
+			return err
+		}
 		storageCommitID, err = transport.PublishSnapshot(expectedStorageCommitID, encoded.Bootstrap, map[string][]byte{encoded.ManifestLocator: encoded.Manifest})
 		if err != nil {
 			return err
@@ -198,6 +224,9 @@ func (engine *Engine) Initialize(workspace, remoteName, repositoryURL, defaultBr
 	}
 	if hasConfiguredRepositoryID && strings.TrimSpace(string(configuredRepositoryID)) != hex.EncodeToString(repository.RepositoryID[:]) {
 		return errors.New("recorded Repository ID does not match Ciphertext Repository")
+	}
+	if err := localstate.EnsureRecoverySecret(secretGitDirectory, secret); err != nil {
+		return err
 	}
 	if configuredErr != nil {
 		if _, err := git(workspace, nil, "remote", "add", remoteName, wantedURL); err != nil {
@@ -276,7 +305,7 @@ func (engine *Engine) Recover(repositoryURL, destination string, secret domain.R
 		return err
 	}
 	if len(decoded.Repository.LogicalRefs) > 0 {
-		return engine.recoverDecoded(repositoryURL, destination, decoded)
+		return engine.recoverDecoded(repositoryURL, destination, secret, decoded)
 	}
 	if destination == "" {
 		destination = defaultDestination(repositoryURL)
@@ -295,7 +324,7 @@ func (engine *Engine) Recover(repositoryURL, destination string, secret domain.R
 		if err := recordRecoveredCheckpoint(temporary, decoded); err != nil {
 			return err
 		}
-		return nil
+		return localstate.EnsureRecoverySecret(filepath.Join(temporary, ".git"), secret)
 	})
 }
 
@@ -324,7 +353,7 @@ func (engine *Engine) RecoverHistorical(repositoryURL, storageCommitID, destinat
 	if err != nil {
 		return fmt.Errorf("authenticate historical Ciphertext Snapshot: %w", err)
 	}
-	return engine.recoverDecoded(repositoryURL, destination, authenticatedSnapshot{
+	return engine.recoverDecoded(repositoryURL, destination, secret, authenticatedSnapshot{
 		DecodedSnapshot: decoded, StorageCommitID: storageCommitID,
 	})
 }
@@ -360,7 +389,7 @@ func (engine *Engine) RecoverForGitClone(repositoryURL, destination string, secr
 		if err := recordRecoveredCheckpoint(temporary, decoded); err != nil {
 			return err
 		}
-		return nil
+		return localstate.EnsureRecoverySecret(filepath.Join(temporary, ".git"), secret)
 	})
 }
 
@@ -657,6 +686,31 @@ func (engine *Engine) Rekey(repositoryURL, logicalGitDirectory string, plan Reke
 		return RekeyResult{}, err
 	}
 	defer operationLock.Close()
+	if engine.localGitDirectory != "" {
+		secretLock, err := localstate.AcquireSecretLock(engine.localGitDirectory)
+		if err != nil {
+			return RekeyResult{}, err
+		}
+		defer secretLock.Close()
+		if _, _, err := localstate.LoadRecoverySecret(engine.localGitDirectory); err != nil {
+			return RekeyResult{}, err
+		}
+		pending, exists, err := localstate.LoadPendingSecret(engine.localGitDirectory)
+		if err != nil {
+			return RekeyResult{}, err
+		}
+		if exists {
+			if pending.RepositoryURL != repositoryURL || pending.Secret != secret {
+				return RekeyResult{}, errors.New("an interrupted Rekey has a different pending Recovery Secret; retry the original Rekey first")
+			}
+			// An explicitly confirmed Rekey may replace an unauthenticatable
+			// old host. Preserve the staged key when retrying that operation.
+			completed, reconcileErr := engine.reconcilePendingSecret(pending)
+			if reconcileErr == nil && completed {
+				return RekeyResult{RepositoryID: pending.RepositoryID}, nil
+			}
+		}
+	}
 	reachableObjectIDs, err := gitdb.ReachableObjectIDsForRefs(logicalGitDirectory, plan.selectedRepository.LogicalRefs)
 	if err != nil {
 		return RekeyResult{}, err
@@ -709,6 +763,14 @@ func (engine *Engine) Rekey(repositoryURL, logicalGitDirectory string, plan Reke
 	if err != nil {
 		return RekeyResult{}, err
 	}
+	if engine.localGitDirectory != "" {
+		if err := localstate.StorePendingSecret(engine.localGitDirectory, localstate.PendingSecret{
+			RepositoryURL: repositoryURL, RepositoryID: candidate.Repository.RepositoryID, Secret: secret,
+			StartingCommit: startingStorageCommitID, PreparedCommit: preparedStorageCommit,
+		}); err != nil {
+			return RekeyResult{}, err
+		}
+	}
 	reportProgress(progress, "Publication")
 	if publicationErr := transport.PublishPrepared(startingStorageCommitID, preparedStorageCommit); publicationErr != nil {
 		verificationTransport, verificationErr := storage.OpenGit(repositoryURL)
@@ -722,8 +784,19 @@ func (engine *Engine) Rekey(repositoryURL, logicalGitDirectory string, plan Reke
 		}
 	}
 	if engine.localGitDirectory != "" {
+		if err := localstate.ReplaceRecoverySecret(engine.localGitDirectory, secret); err != nil {
+			return RekeyResult{}, err
+		}
 		if err := localstate.ReplaceCheckpoint(engine.localGitDirectory, candidate.Repository.RepositoryID, 1, preparedStorageCommit); err != nil {
 			return RekeyResult{}, fmt.Errorf("install new Rollback Checkpoint: %w", err)
+		}
+	}
+	if engine.localGitDirectory != "" {
+		if err := engine.recordRekeyIdentity(repositoryURL, candidate.Repository.RepositoryID); err != nil {
+			return RekeyResult{}, err
+		}
+		if err := localstate.ClearPendingSecret(engine.localGitDirectory); err != nil {
+			return RekeyResult{}, err
 		}
 	}
 	return RekeyResult{RepositoryID: candidate.Repository.RepositoryID}, nil
@@ -1282,7 +1355,7 @@ func canonicalTransactionIntent(state gitdb.State) []byte {
 	return []byte(canonical.String())
 }
 
-func (engine *Engine) recoverDecoded(repositoryURL, destination string, decoded authenticatedSnapshot) error {
+func (engine *Engine) recoverDecoded(repositoryURL, destination string, secret domain.RecoverySecret, decoded authenticatedSnapshot) error {
 	if destination == "" {
 		destination = defaultDestination(repositoryURL)
 	}
@@ -1297,7 +1370,7 @@ func (engine *Engine) recoverDecoded(repositoryURL, destination string, decoded 
 		if err := recordRecoveredCheckpoint(temporary, decoded); err != nil {
 			return err
 		}
-		return nil
+		return localstate.EnsureRecoverySecret(filepath.Join(temporary, ".git"), secret)
 	})
 }
 

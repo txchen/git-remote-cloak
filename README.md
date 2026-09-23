@@ -2,7 +2,7 @@
 
 `git-remote-cloak` stores a private Git backup on an ordinary Repository Host without exposing original files, paths, commit messages, or branch names. The owner works in a normal Git repository; the host sees one `cloak-storage` branch containing opaque ciphertext.
 
-Binary version `v0.1.1` writes Ciphertext Repository format `v1.0`. These versions are independent. The current operationally verified target is Linux amd64.
+Binary version `v0.2.0` writes Ciphertext Repository format `v1.0`. These versions are independent. The current operationally verified target is Linux amd64.
 
 ## Install
 
@@ -30,7 +30,7 @@ Choose a version or an existing writable installation directory when needed:
 
 ```sh
 curl -fsSL https://github.com/txchen/git-remote-cloak/releases/latest/download/install.sh \
-  | CLOAK_VERSION=v0.1.1 CLOAK_INSTALL_DIR="$HOME/.local/bin" bash
+  | CLOAK_VERSION=v0.2.0 CLOAK_INSTALL_DIR="$HOME/.local/bin" bash
 ```
 
 To inspect the script first, download it to a file and run `bash install.sh` after
@@ -46,22 +46,7 @@ Inside the existing Git repository to protect:
 git-remote-cloak init backup https://github.com/OWNER/EMPTY-PRIVATE-REPOSITORY.git
 ```
 
-Cloak displays a Recovery Mnemonic once. Save the complete `cloak-v1:` value and all 24 words outside the Git repository, then type `SAVED`. Store it in a mode-0600 file without placing it in shell history:
-
-```sh
-secret_file="${XDG_CONFIG_HOME:-$HOME/.config}/git-remote-cloak/repository.recovery"
-install -m 700 -d "$(dirname "$secret_file")"
-if test -e "$secret_file"; then
-  echo "using existing Recovery Secret file: $secret_file"
-else
-  install -m 600 /dev/null "$secret_file"
-  read -r -s -p "Recovery Mnemonic: " recovery_mnemonic
-  printf '\n'
-  printf '%s\n' "$recovery_mnemonic" >"$secret_file"
-  unset recovery_mnemonic
-fi
-export CLOAK_RECOVERY_SECRET_FILE="$secret_file"
-```
+Cloak displays a Recovery Mnemonic once. Back up the complete `cloak-v1:` value and all 24 words outside this machine, then type `SAVED`. Cloak automatically saves the local working copy in `.git/cloak/secret` with permissions `0600`. Each repository has its own Secret; changing directories automatically selects the right one. Linked worktrees share their common Git directory's Secret.
 
 Push through the configured Cloak remote using ordinary Git:
 
@@ -76,11 +61,12 @@ Recover on another authorized Linux host:
 ```sh
 git-remote-cloak clone \
   https://github.com/OWNER/EMPTY-PRIVATE-REPOSITORY.git \
-  recovered \
-  --secret-file "$secret_file"
+  recovered
 ```
 
-Do not configure both `CLOAK_RECOVERY_SECRET_FILE` and `--secret-file` for the same command. Cloak rejects ambiguous Recovery Secret sources.
+Enter the saved Recovery Mnemonic at the hidden prompt. Clone saves it locally; subsequent `git push`, `git fetch`, and `git pull` need no environment variables.
+
+For automation, supply one of `CLOAK_RECOVERY_SECRET`, `CLOAK_RECOVERY_SECRET_FILE`, or `--secret-file` (init/clone). An explicit source overrides the local Secret; multiple explicit sources are rejected. Init and clone also save supplied Secrets locally. Keep the offline backup: deleting the local repository deletes its local Secret.
 
 ## Read next
 

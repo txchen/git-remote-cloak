@@ -96,7 +96,7 @@ func isConfiguredHelperInvocation(arguments []string) bool {
 }
 
 func runRemoteHelper(arguments []string) error {
-	recoverySecret, err := acquireSecret("", false)
+	recoverySecret, err := acquireRepositorySecret("", false)
 	if err != nil {
 		return err
 	}
@@ -115,7 +115,7 @@ func runMigrate(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	recoverySecret, err := acquireSecret("", false)
+	recoverySecret, err := acquireRepositorySecret("", false)
 	if err != nil {
 		return err
 	}
@@ -297,6 +297,15 @@ func acquireNewSecret(input *bufio.Reader) (domain.RecoverySecret, error) {
 	if _, environmentFileSet := os.LookupEnv("CLOAK_RECOVERY_SECRET_FILE"); environmentFileSet {
 		return acquireSecret("", false)
 	}
+	if directory, err := absoluteGitDirectory(); err == nil {
+		pending, exists, err := localstate.LoadPendingSecret(directory)
+		if err != nil {
+			return domain.RecoverySecret{}, err
+		}
+		if exists {
+			return pending.Secret, nil
+		}
+	}
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return domain.RecoverySecret{}, errors.New("non-interactive Rekey requires a configured new Recovery Secret")
 	}
@@ -338,7 +347,7 @@ func runCompact(arguments []string) error {
 	if len(arguments) != 1 {
 		return fmt.Errorf("usage: git-remote-cloak compact <remote-name>")
 	}
-	recoverySecret, err := acquireSecret("", false)
+	recoverySecret, err := acquireRepositorySecret("", false)
 	if err != nil {
 		return err
 	}
@@ -433,12 +442,17 @@ func runDoctor(arguments []string) error {
 	if len(positional) != 1 {
 		return fmt.Errorf("usage: git-remote-cloak doctor <repository-url> [--json]")
 	}
-	recoverySecret, err := acquireSecret("", false)
+	gitDirectory := localStateForRepositoryURL(positional[0])
+	acquire := acquireSecret
+	if gitDirectory != "" {
+		acquire = acquireRepositorySecret
+	}
+	recoverySecret, err := acquire("", false)
 	if err != nil {
 		return err
 	}
 	repositoryEngine := engine.New()
-	if gitDirectory := localStateForRepositoryURL(positional[0]); gitDirectory != "" {
+	if gitDirectory != "" {
 		repositoryEngine = engine.NewWithLocalState(gitDirectory)
 	}
 	report, diagnosticErr := repositoryEngine.Doctor(positional[0], recoverySecret)
@@ -466,7 +480,7 @@ func runSetHead(arguments []string) error {
 	if len(arguments) != 2 {
 		return fmt.Errorf("usage: git-remote-cloak set-head <remote-name> <branch>")
 	}
-	recoverySecret, err := acquireSecret("", false)
+	recoverySecret, err := acquireRepositorySecret("", false)
 	if err != nil {
 		return err
 	}
@@ -544,7 +558,7 @@ func runInit(arguments []string) error {
 	if err != nil || len(positional) != 2 {
 		return fmt.Errorf("usage: git-remote-cloak init <remote-name> <repository-url> [--secret-file PATH] [--default-branch BRANCH]")
 	}
-	recoverySecret, err := acquireSecret(secretFile, true)
+	recoverySecret, err := acquireRepositorySecret(secretFile, true)
 	if err != nil {
 		return err
 	}
@@ -568,7 +582,7 @@ func runClone(arguments []string) error {
 	if err != nil || len(positional) < 1 || len(positional) > 2 {
 		return fmt.Errorf("usage: git-remote-cloak clone <repository-url> [directory] [--secret-file PATH] [--storage-commit OBJECT-ID]")
 	}
-	recoverySecret, err := acquireSecret(secretFile, false)
+	recoverySecret, err := acquireCloneSecret(secretFile)
 	if err != nil {
 		return err
 	}

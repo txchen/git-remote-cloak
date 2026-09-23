@@ -43,6 +43,8 @@ func TestInteractiveInitDisplaysMnemonicOnceAndRequiresConfirmation(t *testing.T
 	}
 	transcript += readPTYUntil(t, terminal, "Initialized Ciphertext Repository for remote backup.")
 	waitForInteractiveCommand(t, command, transcript)
+	assertSavedSecret(t, workspace, mnemonic)
+	mustRunWithRepositorySecret(t, binary, workspace, "git", "fetch", "backup")
 	if got := mustGit(t, repositoryHost, "for-each-ref", "--format=%(refname)"); got != "refs/heads/cloak-storage\n" {
 		t.Fatalf("Repository Host refs = %q", got)
 	}

@@ -30,7 +30,7 @@ git-remote-cloak version --json
 git-remote-cloak version --formats
 ```
 
-For release `v0.1.1`, expect Linux amd64, CGo disabled, and exact read/write support for format v1.0.
+For release `v0.2.0`, expect Linux amd64, CGo disabled, and exact read/write support for format v1.0.
 
 ### Manual installation
 
@@ -38,7 +38,7 @@ The installer is optional. To install Linux x86-64 manually, download into a fre
 directory, verify the archive, and put the executable on `PATH`:
 
 ```sh
-version=v0.1.1
+version=v0.2.0
 curl -fLO "https://github.com/txchen/git-remote-cloak/releases/download/${version}/checksums.txt"
 curl -fLO "https://github.com/txchen/git-remote-cloak/releases/download/${version}/git-remote-cloak_${version}_linux_amd64.tar.gz"
 sha256sum --check --ignore-missing checksums.txt
@@ -66,11 +66,16 @@ remote.backup.url=cloak::https://github.com/OWNER/EMPTY-PRIVATE-REPOSITORY.git
 It does not push a local branch, tag, commit, index entry, or worktree change. Make the first backup explicitly:
 
 ```sh
-export CLOAK_RECOVERY_SECRET_FILE=/absolute/path/to/mode-0600-recovery-file
 git push -u backup main
 ```
 
-The Recovery Secret belongs in the Authorized Host's secret store. Keep it out of Git configuration, command arguments, logs, the repository, and shell history. The remote helper never prompts, so unattended `git push` and `git fetch` require `CLOAK_RECOVERY_SECRET` or `CLOAK_RECOVERY_SECRET_FILE`.
+Init automatically saves the generated or supplied Recovery Secret in `.git/cloak/secret` (file `0600`, directory `0700`) before publishing. Git does not track this metadata file. Keep a separate Recovery Mnemonic backup outside this machine: losing the repository also loses its local Secret.
+
+Each repository uses its own local Secret. Linked worktrees use the Secret in their common Git directory. Moving a normal repository with its `.git` directory preserves the Secret. Keep it out of tracked files, Git configuration, command arguments, logs, and shell history.
+
+For automation, supply exactly one explicit source: `CLOAK_RECOVERY_SECRET`, `CLOAK_RECOVERY_SECRET_FILE`, or `--secret-file` for init/clone. These override the local Secret; multiple explicit sources are an error. Daily commands do not replace the saved Secret when using an override. Init refuses to overwrite a different saved Secret. Remove old global Secret exports from your shell configuration to enable automatic repository selection.
+
+For an existing v0.1.x checkout, run `git-remote-cloak init backup URL --secret-file PATH` once using its existing remote name, URL and Secret (unset other Secret sources first). This saves the Secret locally. A non-interactive first init without a supplied Secret still fails.
 
 ## Verify host privacy
 
@@ -84,11 +89,10 @@ Only `refs/heads/cloak-storage` and the host's matching `HEAD` should be visible
 
 ## Daily Git operations
 
-Keep the binary on `PATH` and the Recovery Secret source configured:
+Keep the binary on `PATH`. Cloak automatically finds the current repository’s Secret, including from subdirectories:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
-export CLOAK_RECOVERY_SECRET_FILE=/absolute/path/to/mode-0600-recovery-file
 
 git push backup main
 git fetch backup
@@ -106,23 +110,24 @@ git-remote-cloak status --json
 
 ## Recover on another host
 
-Install the same or a format-compatible binary, configure Git authentication, and provide the Recovery Secret:
+Install the same or a format-compatible binary, configure Git authentication, and run:
 
 ```sh
 git-remote-cloak clone \
   https://github.com/OWNER/REPOSITORY.git \
-  recovered \
-  --secret-file /absolute/path/to/mode-0600-recovery-file
+  recovered
 
 git -C recovered fsck --full
 ```
 
+Enter the complete saved Recovery Mnemonic at the hidden terminal prompt. The validated clone stores it in its own `.git/cloak/secret`. Clone never borrows a Secret from the directory you started in. For unattended recovery, add `--secret-file PATH` or configure one environment source. Direct `git clone cloak::URL` never prompts and requires an environment source for the initial clone; it also saves the Secret locally.
+
 A fresh clone authenticates the returned Ciphertext Snapshot but cannot independently prove that the Repository Host returned the newest valid snapshot. After the first observation, the local Rollback Checkpoint protects future observations.
 
-Diagnose a repository without changing it:
+From the recovered repository, diagnose its remote (an unrelated URL requires an explicit Secret source):
 
 ```sh
-export CLOAK_RECOVERY_SECRET_FILE=/absolute/path/to/mode-0600-recovery-file
+cd recovered
 git-remote-cloak doctor https://github.com/OWNER/REPOSITORY.git
 git-remote-cloak doctor https://github.com/OWNER/REPOSITORY.git --json
 ```
@@ -142,9 +147,9 @@ unset CLOAK_RECOVERY_SECRET CLOAK_RECOVERY_SECRET_FILE
 git-remote-cloak rekey backup
 ```
 
-Read the displayed ref plan before confirming. Interactive Rekey displays a new Recovery Mnemonic once; save its complete `cloak-v1:` value before confirming it. To perform unattended Rekey, configure a newly generated Secret source rather than the current repository Secret. Repository Host retention may preserve superseded ciphertext after Compaction or Rekey.
+Read the displayed ref plan before confirming. Interactive Rekey displays a new Recovery Mnemonic once; save its complete `cloak-v1:` value before confirming it. To perform unattended Rekey, configure a newly generated Secret source rather than the current repository Secret. Successful Rekey automatically replaces the locally saved Secret. Before publication, Cloak saves the candidate in a separate protected `.git/cloak/secret.pending` file. If a process exits after publication, the next automatic Secret lookup authenticates the published candidate and completes the local update. If publication did not happen, the active Secret stays unchanged; retrying Rekey reuses the pending candidate. Keep the pending file until the operation resolves. An unexplained remote history still fails closed. Repository Host retention may preserve superseded ciphertext after Compaction or Rekey.
 
-Clear only reconstructable local ciphertext cache:
+Clear only reconstructable local ciphertext cache; this preserves the Secret and Rollback Checkpoint:
 
 ```sh
 git-remote-cloak cache clear
@@ -174,8 +179,11 @@ An ordinary binary upgrade never rewrites repository format. Format Migration is
 `multiple Recovery Secret sources configured`
 : Keep exactly one of `CLOAK_RECOVERY_SECRET`, `CLOAK_RECOVERY_SECRET_FILE`, or command-specific `--secret-file`.
 
-`Recovery Secret is required in non-interactive mode`
-: Export a Secret source before ordinary Git operations. The remote helper intentionally never prompts.
+`no Recovery Secret configured` / `non-interactive init requires a configured Recovery Secret`
+: Initialize or recover the repository once, or supply one explicit Secret source for automation. The remote helper intentionally never prompts.
+
+Managed Recovery Secret file is damaged or has unsafe permissions
+: Preserve the file and restore it from the offline Recovery Mnemonic backup, or correct its permissions to `0600`. Cloak never silently generates a replacement for a damaged saved Secret.
 
 `suspected rollback`
 : Preserve `.git/cloak/state` and run `doctor --json`. Cloak fails closed when authenticated state contradicts the trusted checkpoint or required pre-Compaction Storage commits are unavailable.

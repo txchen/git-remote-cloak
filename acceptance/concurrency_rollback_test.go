@@ -219,7 +219,17 @@ func TestTrustedCheckpointRejectsKnownRollbackAndStatusExportsPublicState(t *tes
 		t.Fatalf("status freshness = %q", decoded.Freshness)
 	}
 	statePath := filepath.Join(authorized, ".git", "cloak", "state")
-	assertFilesExclude(t, filepath.Dir(statePath), testMnemonic, "first protected value", "second protected value", "refs/heads/main")
+	assertSavedSecret(t, authorized, testMnemonic)
+	entries, err := os.ReadDir(filepath.Dir(statePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == "secret" {
+			continue
+		}
+		assertFilesExclude(t, filepath.Join(filepath.Dir(statePath), entry.Name()), testMnemonic, "first protected value", "second protected value", "refs/heads/main")
+	}
 
 	mustGit(t, host, "update-ref", "refs/heads/cloak-storage", string(bytes.TrimSpace([]byte(olderStorageCommitID))))
 	fetch := exec.Command("git", "fetch", "origin")

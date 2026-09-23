@@ -228,13 +228,19 @@ force-with-lease are supported. A multi-ref push is all-or-none.
 
 ### 4.4 Secret sources
 
-Accepted sources are:
+The default source is the current repository's `.git/cloak/secret`, stored in
+the common Git directory for linked worktrees. Init and clone save the validated
+Secret here with file permissions 0600 and directory permissions 0700. Clone
+does not inherit a surrounding repository's Secret. An offline Recovery Mnemonic
+backup remains necessary.
+
+Explicit sources override this default:
 
 - `CLOAK_RECOVERY_SECRET`;
 - the file named by `CLOAK_RECOVERY_SECRET_FILE`; and
 - `--secret-file PATH` for explicit `init` and `clone`.
 
-More than one configured source is an error. Cloak never accepts
+More than one explicit source is an error. Cloak never accepts
 `--secret VALUE`, stores the Secret in Git configuration, writes it to cache or
 journals, or transmits it to the Repository Host.
 
@@ -242,9 +248,14 @@ Human `init` and `clone` may use a masked terminal prompt. A Git-invoked remote
 helper never prompts. A non-interactive `init` must receive a Secret and never
 prints one.
 
-A broadly readable Secret file produces a warning rather than a hard failure,
+A broadly readable external input Secret file produces a warning rather than a hard failure,
 because service and container environments may require that arrangement.
 Directories, empty files, unreadable files, and invalid mnemonics fail.
+Managed local Secret files also reject symlinks and group/other permissions.
+Rekey stages the new credential in the dedicated protected `secret.pending`
+file before publication, then atomically replaces `secret` after confirmed
+publication. Pending publication is reconciled before automatic Secret lookup;
+ordinary caches and transaction journals remain Secret-free.
 
 ## 5. Architecture
 
@@ -363,12 +374,14 @@ injection tests without changing Repository Engine behavior.
 
 This Module owns:
 
+- `.git/cloak/secret` and the temporary credential transition file `secret.pending`;
 - `.git/cloak/cache/`;
 - `.git/cloak/transactions/`; and
 - `.git/cloak/state`.
 
 It enforces atomic local replacement, restrictive permissions for created
-plaintext temporary data, Secret-free persistence, cache validation, crash
+plaintext temporary data, dedicated Secret persistence, Secret-free caches and
+transaction journals, cache validation, crash
 journal recovery, and Rollback Checkpoints.
 
 ## 6. Ciphertext Repository representation

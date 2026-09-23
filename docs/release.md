@@ -4,7 +4,7 @@
 
 V1 is a single-owner private Git backup for small repositories. Release `v0.1.0` is operationally verified on Linux amd64 with GitHub HTTPS. Linux arm64 and macOS archives are published, but they are not part of the current manual provider-validation claim. Windows and WSL are not currently certified. Each private submodule uses an independent Ciphertext Repository and Recovery Secret.
 
-An Authorized Host may obtain the Recovery Secret from `CLOAK_RECOVERY_SECRET`, `CLOAK_RECOVERY_SECRET_FILE`, or `--secret-file` where the command permits it. A service is expected to persist one of the non-interactive sources in its own secret store. The remote helper never prompts, and the Recovery Secret must not be placed in Git configuration, command arguments, logs, caches, or journals.
+From v0.2.0, an Authorized Host normally reads its repository-local `.git/cloak/secret`. Init and clone persist generated or supplied Secrets with permissions `0600`; linked worktrees share their common Git directory's Secret. Explicit `CLOAK_RECOVERY_SECRET`, `CLOAK_RECOVERY_SECRET_FILE`, or `--secret-file` inputs override local storage. The remote helper never prompts. Dedicated `secret` and `secret.pending` files contain credentials; Git configuration, command arguments, logs, caches, and general transaction journals must not.
 
 Git LFS and partial clones/promisor objects are rejected. Ordinary Git binary blobs are supported.
 
@@ -39,6 +39,12 @@ The accepted `v0.1.0` release gate is:
 5. Download the published assets, verify every checksum, and run the published Linux amd64 binary.
 
 Broader GitHub/GitLab × SSH/HTTPS certification remains available through the [provider certification runbook](provider-certification.md), but is outside the current `v0.1.0` support claim.
+
+## v0.2.0 changes
+
+Repository-local Recovery Secrets remove environment switching from daily Git operations. Interactive clone asks for the Recovery Mnemonic once using hidden input. Init and clone save a protected local copy, while Rekey durably stages its new Secret before publication and automatically updates the active copy after success or recovery from a lost response. Offline Recovery Mnemonic backups remain required.
+
+Acceptance tests cover independent repositories, directory moves, linked worktrees, hidden clone input, invalid local files, explicit overrides, and Rekey process-exit faults. Release smoke tests exercise push and fetch without Secret environment variables. Ciphertext Repository format remains v1.0; the historical provider-certification scope below is unchanged.
 
 ## v0.1.1 changes
 

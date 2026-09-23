@@ -25,7 +25,12 @@ git -C "${smoke_root}/owner" commit -m 'release smoke commit' >/dev/null
 (
   cd "${smoke_root}/owner"
   "${cloak_binary}" init backup "${smoke_root}/host.git"
+  unset CLOAK_RECOVERY_SECRET CLOAK_RECOVERY_SECRET_FILE
   git push backup main
 ) >/dev/null
 "${cloak_binary}" clone "${smoke_root}/host.git" "${smoke_root}/recovered" >/dev/null
 cmp "${smoke_root}/owner/release-smoke.txt" "${smoke_root}/recovered/release-smoke.txt"
+(
+  unset CLOAK_RECOVERY_SECRET CLOAK_RECOVERY_SECRET_FILE
+  git -C "${smoke_root}/recovered" fetch origin
+) >/dev/null
