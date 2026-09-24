@@ -59,12 +59,10 @@ Replace `master` with the current local branch name when necessary. The branch m
 Recover on another authorized Linux host:
 
 ```sh
-git-remote-cloak clone \
-  https://github.com/OWNER/EMPTY-PRIVATE-REPOSITORY.git \
-  recovered
+git-remote-cloak clone https://github.com/OWNER/EMPTY-PRIVATE-REPOSITORY.git
 ```
 
-Enter the saved Recovery Mnemonic at the hidden prompt. Clone saves it locally; subsequent `git push`, `git fetch`, and `git pull` need no environment variables.
+At the hidden prompt, enter the **complete** saved Recovery Mnemonic: the literal `cloak-v1:` prefix followed by all 24 space-separated words. The words alone are rejected. Without a directory argument, Cloak creates `EMPTY-PRIVATE-REPOSITORY` in the current directory. Clone saves the Recovery Secret locally; subsequent `git push`, `git fetch`, and `git pull` need no environment variables.
 
 For automation, supply one of `CLOAK_RECOVERY_SECRET`, `CLOAK_RECOVERY_SECRET_FILE`, or `--secret-file` (init/clone). An explicit source overrides the local Secret; multiple explicit sources are rejected. Init and clone also save supplied Secrets locally. Keep the offline backup: deleting the local repository deletes its local Secret.
 
