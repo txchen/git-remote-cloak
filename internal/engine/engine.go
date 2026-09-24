@@ -1224,6 +1224,11 @@ func (engine *Engine) readSnapshot(repositoryURL string, secret domain.RecoveryS
 }
 
 func (engine *Engine) decodeTransportSnapshot(secret domain.RecoverySecret, transport *storage.Git) (cloakformat.DecodedSnapshot, string, error) {
+	if storageCommitID, err := transport.Current(); err == nil {
+		// Some hosts reject explicit multi-object fetches; the bounded reads below
+		// remain the authoritative path when prefetch is unavailable.
+		_ = transport.PrefetchSnapshotBlobs(storageCommitID, localstate.NewCache(engine.localGitDirectory).HasObject)
+	}
 	bootstrap, storageCommitID, err := transport.ReadBootstrap()
 	if err != nil {
 		return cloakformat.DecodedSnapshot{}, "", err

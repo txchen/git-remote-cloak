@@ -61,6 +61,58 @@ func (transport *Git) Close() error {
 	return os.RemoveAll(transport.temporaryRoot)
 }
 
+// PrefetchSnapshotBlobs fetches blobs absent from a filtered clone in batches.
+// Cached ciphertext can be read later without downloading its Git blob.
+func (transport *Git) PrefetchSnapshotBlobs(storageCommitID string, hasCachedObject func(string) bool) error {
+	if !validStorageCommitID(storageCommitID) || storageCommitID == transport.zeroObject {
+		return errors.New("invalid Storage commit ID")
+	}
+	output, err := runGit(transport.path, nil, "rev-list", "--objects", "--missing=print", "--max-count=1", storageCommitID)
+	if err != nil {
+		return err
+	}
+	missing := make(map[string]bool)
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.HasPrefix(line, "?") && validStorageCommitID(line[1:]) {
+			missing[line[1:]] = true
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	tree, err := runGit(transport.path, nil, "ls-tree", "-r", "-z", storageCommitID)
+	if err != nil {
+		return err
+	}
+	objectIDs := make([]string, 0, len(missing))
+	for _, entry := range strings.Split(string(tree), "\x00") {
+		metadata, path, found := strings.Cut(entry, "\t")
+		if !found {
+			continue
+		}
+		fields := strings.Fields(metadata)
+		if len(fields) != 3 || fields[1] != "blob" || !missing[fields[2]] {
+			continue
+		}
+		if path != "bootstrap" {
+			locator, ok := strings.CutPrefix(path, "objects/")
+			if !ok || locator == "" || strings.Contains(locator, "/") || hasCachedObject != nil && hasCachedObject(locator) {
+				continue
+			}
+		}
+		objectIDs = append(objectIDs, fields[2])
+		delete(missing, fields[2])
+	}
+	for start := 0; start < len(objectIDs); start += 512 {
+		end := min(start+512, len(objectIDs))
+		arguments := append([]string{"fetch", "--no-tags", "origin"}, objectIDs[start:end]...)
+		if _, err := runGit(transport.path, nil, arguments...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // PublishSnapshot uploads immutable ciphertext and compare-and-swap publishes through ordinary Git push.
 func (transport *Git) PublishSnapshot(expectedStorageCommitID string, bootstrap []byte, ciphertextObjects map[string][]byte) (string, error) {
 	commitID, err := transport.PrepareSnapshot(expectedStorageCommitID, bootstrap, ciphertextObjects)

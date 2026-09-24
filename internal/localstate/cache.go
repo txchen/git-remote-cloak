@@ -48,6 +48,16 @@ func (cache *Cache) ReadObject(locator string) ([]byte, bool) {
 	return contents, true
 }
 
+// HasObject reports whether a ciphertext cache entry can be tried before
+// fetching its blob. ReadObject still validates the entry before use.
+func (cache *Cache) HasObject(locator string) bool {
+	if cache == nil || !validLocator(locator) {
+		return false
+	}
+	info, err := os.Lstat(filepath.Join(cache.root, "objects", locator))
+	return err == nil && info.Mode().IsRegular()
+}
+
 // StoreSnapshot atomically adds authenticated snapshot inputs to the cache.
 // Existing valid immutable entries are reused without rewriting them.
 func (cache *Cache) StoreSnapshot(storageCommitID string, bootstrap []byte, objects map[string][]byte) error {
