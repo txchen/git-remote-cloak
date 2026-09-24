@@ -42,7 +42,7 @@ Broader GitHub/GitLab × SSH/HTTPS certification remains available through the [
 
 ## v0.2.1 changes
 
-Storage History commits now use the invoking Git repository's configured author and committer identity, including repository-local `user.name` and `user.email`. Hosts that require a recognized email can accept Cloak publications without a Cloak-specific setting. Original Logical Repository commit identities remain encrypted and unchanged. The chosen outer identity is visible to the Repository Host. Ciphertext Repository format remains v1.0.
+Storage History commits now use the invoking Git repository's configured author and committer identity, including repository-local `user.name` and `user.email`. Without configured identity, they retain the anonymous `git-remote-cloak <cloak@invalid>` default. Hosts that require a recognized email can accept Cloak publications without a Cloak-specific setting. Original Logical Repository commit identities remain encrypted and unchanged. The chosen outer identity is visible to the Repository Host. Ciphertext Repository format remains v1.0.
 
 ## v0.2.0 changes
 

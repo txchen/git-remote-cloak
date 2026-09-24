@@ -192,7 +192,7 @@ Initialization rejects the Repository Host
 : Confirm the host repository has no refs and that authentication permits creating and force-updating `refs/heads/cloak-storage`.
 
 Host rejects the Storage commit email
-: Cloak uses the invoking Git repository's configured `user.name` and `user.email` for Storage History commits. If the host requires a work email, set it with ordinary Git configuration, for example `git config user.email you@your-company.example` in the Plaintext Workspace, then retry `init`. Git identity environment variables also work. The Repository Host can see this outer commit identity; original commit identities remain encrypted and unchanged.
+: Cloak uses the invoking Git repository's configured `user.name` and `user.email` for Storage History commits. When no Git identity is configured, it uses `git-remote-cloak <cloak@invalid>`. If the host requires a work email, set it with ordinary Git configuration, for example `git config user.email you@your-company.example` in the Plaintext Workspace, then retry `init`. Git identity environment variables also work. The Repository Host can see this outer commit identity; original commit identities remain encrypted and unchanged.
 
 Push rejects Git LFS or partial clone state
 : Store ordinary blobs directly in Git and use a full, non-promisor repository. There is no bypass flag.

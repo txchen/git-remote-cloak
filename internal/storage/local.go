@@ -296,19 +296,17 @@ func runGit(gitDirectory string, stdin []byte, arguments ...string) ([]byte, err
 func appendCallerGitIdentity(environment []string) []string {
 	for _, setting := range []struct {
 		key       string
+		fallback  string
 		variables []string
 	}{
-		{"user.name", []string{"GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"}},
-		{"user.email", []string{"GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"}},
+		{"user.name", "git-remote-cloak", []string{"GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"}},
+		{"user.email", "cloak@invalid", []string{"GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"}},
 	} {
 		command := exec.Command("git", "config", "--get", setting.key)
 		output, err := command.Output()
-		if err != nil {
-			continue
-		}
-		value := strings.TrimSpace(string(output))
-		if value == "" {
-			continue
+		value := setting.fallback
+		if configured := strings.TrimSpace(string(output)); err == nil && configured != "" {
+			value = configured
 		}
 		for _, variable := range setting.variables {
 			if _, set := os.LookupEnv(variable); !set {
