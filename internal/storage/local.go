@@ -18,7 +18,7 @@ import (
 const StorageRef = "refs/heads/cloak-storage"
 
 const (
-	maximumBootstrapBlobSize  = 16 + 64*1024
+	MaximumBootstrapBlobSize  = 16 + 64*1024
 	maximumCiphertextBlobSize = 32*1024*1024 + 28
 )
 
@@ -141,7 +141,7 @@ func (transport *LocalBare) ReadBootstrap() ([]byte, string, error) {
 // ReadBootstrapAt reads the bounded Bootstrap Header from one explicit
 // retained Storage History commit without changing the Storage Ref.
 func (transport *LocalBare) ReadBootstrapAt(storageCommitID string) ([]byte, error) {
-	bootstrap, err := transport.readBoundedBlob(storageCommitID+":bootstrap", maximumBootstrapBlobSize)
+	bootstrap, err := transport.readBoundedBlob(storageCommitID+":bootstrap", MaximumBootstrapBlobSize)
 	if err != nil {
 		return nil, fmt.Errorf("read Bootstrap Header: %w", err)
 	}

@@ -1,6 +1,8 @@
 package acceptance_test
 
 import (
+	"bytes"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -22,7 +24,7 @@ func TestOptInDiagnosticsExplainPushWithoutLoggingProtectedInputs(t *testing.T) 
 	}
 
 	writeAndCommit(t, workspace, "private-file-name.txt", "new protected contents\n", "another private message")
-	for _, noOp := range []bool{false, true} {
+	for inspection, noOp := range []bool{false, true, true} {
 		command := exec.Command("git", "push", "backup", "main")
 		command.Dir = workspace
 		command.Env = append(cloakGitEnvironment(binary), "CLOAK_LOG=debug")
@@ -46,6 +48,13 @@ func TestOptInDiagnosticsExplainPushWithoutLoggingProtectedInputs(t *testing.T) 
 			if !strings.Contains(log, "Everything up-to-date") {
 				t.Fatalf("no-op push lacked completion message:\n%s", log)
 			}
+			if inspection == 2 {
+				for _, marker := range []string{"bootstrap cache hit", "storage blobs to fetch=0"} {
+					if !strings.Contains(log, marker) {
+						t.Fatalf("repeated no-op push did not reuse its Bootstrap Header (%q):\n%s", marker, log)
+					}
+				}
+			}
 		} else {
 			for _, marker := range []string{"push attempt started", "candidate validation started", "storage ref publication started"} {
 				if !strings.Contains(log, marker) {
@@ -58,5 +67,24 @@ func TestOptInDiagnosticsExplainPushWithoutLoggingProtectedInputs(t *testing.T) 
 				t.Fatalf("diagnostic push logged protected input %q", protected)
 			}
 		}
+	}
+	storageCommitID := strings.TrimSpace(mustGit(t, host, "rev-parse", "refs/heads/cloak-storage"))
+	bootstrapPath := filepath.Join(workspace, ".git", "cloak", "cache", "snapshots", storageCommitID, "bootstrap")
+	original, err := os.ReadFile(bootstrapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bootstrapPath, []byte("tampered bootstrap"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("git", "push", "backup", "main")
+	command.Dir = workspace
+	command.Env = append(cloakGitEnvironment(binary), "CLOAK_LOG=debug")
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "Everything up-to-date") || !strings.Contains(string(output), "storage blobs to fetch=1") {
+		t.Fatalf("corrupt Bootstrap cache did not fall back to the Repository Host: %v\n%s", err, output)
+	}
+	if restored, err := os.ReadFile(bootstrapPath); err != nil || !bytes.Equal(restored, original) {
+		t.Fatalf("corrupt Bootstrap cache was not repaired: %v", err)
 	}
 }

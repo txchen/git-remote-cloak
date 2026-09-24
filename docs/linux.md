@@ -30,7 +30,7 @@ git-remote-cloak version --json
 git-remote-cloak version --formats
 ```
 
-For release `v0.3.1`, expect Linux amd64, CGo disabled, and exact read/write support for format v1.0.
+For release `v0.3.3`, expect Linux amd64, CGo disabled, and exact read/write support for format v1.0.
 
 ### Manual installation
 
@@ -38,7 +38,7 @@ The installer is optional. To install Linux x86-64 manually, download into a fre
 directory, verify the archive, and put the executable on `PATH`:
 
 ```sh
-version=v0.3.1
+version=v0.3.3
 curl -fLO "https://github.com/txchen/git-remote-cloak/releases/download/${version}/checksums.txt"
 curl -fLO "https://github.com/txchen/git-remote-cloak/releases/download/${version}/git-remote-cloak_${version}_linux_amd64.tar.gz"
 sha256sum --check --ignore-missing checksums.txt

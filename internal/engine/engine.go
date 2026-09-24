@@ -1252,11 +1252,17 @@ func (engine *Engine) readSnapshot(repositoryURL string, secret domain.RecoveryS
 
 func (engine *Engine) decodeTransportSnapshot(secret domain.RecoverySecret, transport *storage.Git) (cloakformat.DecodedSnapshot, string, error) {
 	defer diagnostics.Stage("snapshot decode")()
+	cache := localstate.NewCache(engine.localGitDirectory)
 	if storageCommitID, err := transport.Current(); err == nil {
+		cachedBootstrap, _ := cache.ReadBootstrap(storageCommitID, storage.MaximumBootstrapBlobSize)
 		// Some hosts reject explicit multi-object fetches; the bounded reads below
 		// remain the authoritative path when prefetch is unavailable.
-		if err := transport.PrefetchSnapshotBlobs(storageCommitID, localstate.NewCache(engine.localGitDirectory).HasObject); err != nil {
+		useCachedBootstrap, err := transport.PrefetchSnapshotBlobs(storageCommitID, cache.HasObject, cachedBootstrap)
+		if err != nil {
 			diagnostics.Event("storage blob prefetch unavailable; falling back to individual reads")
+		} else if useCachedBootstrap {
+			decoded, err := engine.decodeTransportSnapshotBytes(secret, transport, cachedBootstrap, storageCommitID, true)
+			return decoded, storageCommitID, err
 		}
 	}
 	bootstrap, storageCommitID, err := transport.ReadBootstrap()

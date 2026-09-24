@@ -40,6 +40,14 @@ The accepted `v0.1.0` release gate is:
 
 Broader GitHub/GitLab × SSH/HTTPS certification remains available through the [provider certification runbook](provider-certification.md), but is outside the current `v0.1.0` support claim.
 
+## v0.3.3 changes
+
+Repeated inspection now reuses the cached Bootstrap Header when its bytes match the current Storage commit's Git tree. An absent or damaged cache entry falls back to the Repository Host and is repaired after authentication. This removes the remaining per-inspection blob fetch for an unchanged snapshot; Ciphertext Repository format remains v1.0.
+
+## v0.3.2 changes
+
+Transaction journal reconciliation skips unused Compaction history checks and checks other prepared commits only in the fetched Storage History. This prevents an implicit remote fetch during an unchanged push. Ciphertext Repository format remains v1.0.
+
 ## v0.3.1 changes
 
 Repeated inspection of an unchanged Ciphertext Snapshot now reuses the existing trusted Rollback Checkpoint and bootstrap cache file instead of rewriting them. Debug logging separates checkpoint validation, cache update, and transaction reconciliation timings to diagnose slow no-change pushes. The original snapshot authentication and rollback checks still run. Ciphertext Repository format remains v1.0.

@@ -64,15 +64,16 @@ func (transport *Git) Close() error {
 }
 
 // PrefetchSnapshotBlobs fetches blobs absent from a filtered clone in batches.
-// Cached ciphertext can be read later without downloading its Git blob.
-func (transport *Git) PrefetchSnapshotBlobs(storageCommitID string, hasCachedObject func(string) bool) error {
+// Cached inputs can be reused when the Bootstrap Header matches its Git tree
+// entry; ciphertext is authenticated during snapshot decoding.
+func (transport *Git) PrefetchSnapshotBlobs(storageCommitID string, hasCachedObject func(string) bool, cachedBootstrap []byte) (bool, error) {
 	defer diagnostics.Stage("storage blob prefetch")()
 	if !validStorageCommitID(storageCommitID) || storageCommitID == transport.zeroObject {
-		return errors.New("invalid Storage commit ID")
+		return false, errors.New("invalid Storage commit ID")
 	}
 	output, err := runGit(transport.path, nil, "rev-list", "--objects", "--missing=print", "--max-count=1", storageCommitID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	missing := make(map[string]bool)
 	for _, line := range strings.Split(string(output), "\n") {
@@ -82,15 +83,22 @@ func (transport *Git) PrefetchSnapshotBlobs(storageCommitID string, hasCachedObj
 	}
 	if len(missing) == 0 {
 		diagnostics.Count("missing storage blobs", 0)
-		return nil
+		return false, nil
 	}
 	diagnostics.Count("missing storage blobs", len(missing))
 	tree, err := runGit(transport.path, nil, "ls-tree", "-r", "-z", storageCommitID)
 	if err != nil {
-		return err
+		return false, err
+	}
+	var cachedBootstrapID string
+	if len(cachedBootstrap) > 0 && len(cachedBootstrap) <= MaximumBootstrapBlobSize {
+		if output, err := runGit(transport.path, cachedBootstrap, "hash-object", "--stdin"); err == nil {
+			cachedBootstrapID = strings.TrimSpace(string(output))
+		}
 	}
 	objectIDs := make([]string, 0, len(missing))
 	cached := 0
+	useCachedBootstrap := false
 	for _, entry := range strings.Split(string(tree), "\x00") {
 		metadata, path, found := strings.Cut(entry, "\t")
 		if !found {
@@ -98,6 +106,12 @@ func (transport *Git) PrefetchSnapshotBlobs(storageCommitID string, hasCachedObj
 		}
 		fields := strings.Fields(metadata)
 		if len(fields) != 3 || fields[1] != "blob" || !missing[fields[2]] {
+			continue
+		}
+		if path == "bootstrap" && fields[2] == cachedBootstrapID {
+			useCachedBootstrap = true
+			cached++
+			delete(missing, fields[2])
 			continue
 		}
 		if path != "bootstrap" {
@@ -115,16 +129,19 @@ func (transport *Git) PrefetchSnapshotBlobs(storageCommitID string, hasCachedObj
 	}
 	diagnostics.Count("cached storage blobs", cached)
 	diagnostics.Count("storage blobs to fetch", len(objectIDs))
+	if useCachedBootstrap {
+		diagnostics.Event("bootstrap cache hit")
+	}
 	for start := 0; start < len(objectIDs); start += 512 {
 		end := min(start+512, len(objectIDs))
 		arguments := append([]string{"fetch", "--no-tags", "origin"}, objectIDs[start:end]...)
 		diagnostics.Event("storage blob fetch started")
 		if _, err := runGit(transport.path, nil, arguments...); err != nil {
-			return err
+			return false, err
 		}
 		diagnostics.Event("storage blob fetch completed")
 	}
-	return nil
+	return useCachedBootstrap, nil
 }
 
 // PublishSnapshot uploads immutable ciphertext and compare-and-swap publishes through ordinary Git push.

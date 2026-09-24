@@ -59,6 +59,24 @@ func (cache *Cache) HasObject(locator string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
+// ReadBootstrap returns a bounded cached Bootstrap Header for one Storage
+// commit. The caller must verify it against that commit's Git tree before use.
+func (cache *Cache) ReadBootstrap(storageCommitID string, maximumSize int) ([]byte, bool) {
+	if cache == nil || !isLowercaseAlphanumeric(storageCommitID) || maximumSize <= 0 {
+		return nil, false
+	}
+	path := filepath.Join(cache.root, "snapshots", storageCommitID, "bootstrap")
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size() > int64(maximumSize) {
+		return nil, false
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || len(contents) > maximumSize {
+		return nil, false
+	}
+	return contents, true
+}
+
 // StoreSnapshot atomically adds authenticated snapshot inputs to the cache.
 // Existing valid immutable entries are reused without rewriting them.
 func (cache *Cache) StoreSnapshot(storageCommitID string, bootstrap []byte, objects map[string][]byte) error {

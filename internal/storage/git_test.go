@@ -137,3 +137,53 @@ func TestGitFetchesRetainedHistoryAcrossAParentlessRoot(t *testing.T) {
 		t.Fatal("invalid historical Storage commit ID was accepted")
 	}
 }
+
+func TestPrefetchSnapshotBlobsUsesOnlyBootstrapMatchingCurrentTree(t *testing.T) {
+	hostPath := filepath.Join(t.TempDir(), "host.git")
+	if output, err := exec.Command("git", "init", "--bare", hostPath).CombinedOutput(); err != nil {
+		t.Fatalf("initialize host: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "--git-dir="+hostPath, "config", "uploadpack.allowFilter", "true").CombinedOutput(); err != nil {
+		t.Fatalf("enable filtered clone: %v\n%s", err, output)
+	}
+	host, err := OpenLocalBare(hostPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero, err := host.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap := []byte("authenticated bootstrap")
+	commitID, err := host.PublishSnapshot(zero, bootstrap, map[string][]byte{"ciphertext": []byte("encrypted contents")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name        string
+		candidate   []byte
+		wantCache   bool
+		wantPresent bool
+	}{
+		{name: "matching cache", candidate: bootstrap, wantCache: true},
+		{name: "tampered cache", candidate: []byte("tampered bootstrap"), wantPresent: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			transport, err := OpenGit("file://" + hostPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer transport.Close()
+			usedCache, err := transport.PrefetchSnapshotBlobs(commitID, func(string) bool { return true }, test.candidate)
+			if err != nil || usedCache != test.wantCache {
+				t.Fatalf("prefetch used cache=%v, err=%v, want cache=%v", usedCache, err, test.wantCache)
+			}
+			command := exec.Command("git", "--git-dir="+transport.path, "cat-file", "-e", commitID+":bootstrap")
+			command.Env = append(os.Environ(), "GIT_NO_LAZY_FETCH=1")
+			present := command.Run() == nil
+			if present != test.wantPresent {
+				t.Fatalf("bootstrap blob present=%v, want %v", present, test.wantPresent)
+			}
+		})
+	}
+}
