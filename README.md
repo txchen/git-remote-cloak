@@ -2,7 +2,7 @@
 
 `git-remote-cloak` stores a private Git backup on an ordinary Repository Host without exposing original files, paths, commit messages, or branch names. The owner works in a normal Git repository; the host sees one `cloak-storage` branch containing opaque ciphertext.
 
-Binary version `v0.3.1` writes Ciphertext Repository format `v1.0`. These versions are independent. The current operationally verified target is Linux amd64.
+Binary version `v0.3.2` writes Ciphertext Repository format `v1.0`. These versions are independent. The current operationally verified target is Linux amd64.
 
 ## Install
 
@@ -30,7 +30,7 @@ Choose a version or an existing writable installation directory when needed:
 
 ```sh
 curl -fsSL https://github.com/txchen/git-remote-cloak/releases/latest/download/install.sh \
-  | CLOAK_VERSION=v0.3.1 CLOAK_INSTALL_DIR="$HOME/.local/bin" bash
+  | CLOAK_VERSION=v0.3.2 CLOAK_INSTALL_DIR="$HOME/.local/bin" bash
 ```
 
 To inspect the script first, download it to a file and run `bash install.sh` after

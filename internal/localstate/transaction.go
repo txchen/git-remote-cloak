@@ -133,8 +133,18 @@ func ReconcileTransactions(gitDirectory string, secret domain.RecoverySecret, re
 		}
 		intentID := strings.TrimSuffix(entry.Name(), ".json")
 		transaction, valid := LoadTransaction(gitDirectory, intentID, secret, repositoryID)
-		published := valid && (transaction.PreparedStorageCommitID == currentStorageCommitID || storageHistoryContains != nil && storageHistoryContains(transaction.PreparedStorageCommitID))
-		if !valid || published && transaction.Operation != CompactionOperation {
+		if !valid {
+			_ = os.Remove(filepath.Join(directory, entry.Name()))
+			continue
+		}
+		// A Compaction journal is consumed only by an explicit retry. Checking
+		// its publication here cannot change reconciliation's decision.
+		if transaction.Operation == CompactionOperation {
+			continue
+		}
+		published := transaction.PreparedStorageCommitID == currentStorageCommitID ||
+			storageHistoryContains != nil && storageHistoryContains(transaction.PreparedStorageCommitID)
+		if published {
 			_ = os.Remove(filepath.Join(directory, entry.Name()))
 		}
 	}

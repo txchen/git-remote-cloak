@@ -244,11 +244,16 @@ func concurrentPushError(message string) bool {
 	return false
 }
 
-// ContainsStorageCommit reports whether a commit is retained in the fetched
-// Storage History.
+// ContainsStorageCommit checks the fetched Storage History without triggering
+// a promisor remote fetch. Journal reconciliation runs during every inspection
+// and must not contact the Repository Host for an old prepared commit.
 func (transport *Git) ContainsStorageCommit(storageCommitID string) bool {
-	_, err := runGit(transport.path, nil, "cat-file", "-e", storageCommitID+"^{commit}")
-	return err == nil
+	if !validStorageCommitID(storageCommitID) {
+		return false
+	}
+	command := exec.Command("git", "--git-dir="+transport.path, "cat-file", "-e", storageCommitID+"^{commit}")
+	command.Env = append(gitexec.Environment(os.Environ()), "GIT_NO_LAZY_FETCH=1")
+	return command.Run() == nil
 }
 
 // FetchStorageCommit obtains one retained historical Storage commit by object ID without changing Storage Ref state.

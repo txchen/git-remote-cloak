@@ -85,6 +85,9 @@ func TestGitFetchesRetainedHistoryAcrossAParentlessRoot(t *testing.T) {
 	if output, err := exec.Command("git", "init", "--bare", hostPath).CombinedOutput(); err != nil {
 		t.Fatalf("initialize local Repository Host: %v\n%s", err, output)
 	}
+	if output, err := exec.Command("git", "--git-dir="+hostPath, "config", "uploadpack.allowFilter", "true").CombinedOutput(); err != nil {
+		t.Fatalf("enable filtered fetch: %v\n%s", err, output)
+	}
 	host, err := OpenLocalBare(hostPath)
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +112,7 @@ func TestGitFetchesRetainedHistoryAcrossAParentlessRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	transport, err := OpenGit(hostPath)
+	transport, err := OpenGit("file://" + hostPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,8 +121,14 @@ func TestGitFetchesRetainedHistoryAcrossAParentlessRoot(t *testing.T) {
 	if err != nil || gotRoot != root {
 		t.Fatalf("Storage History root = %q, err=%v, want %q", gotRoot, err, root)
 	}
+	if transport.ContainsStorageCommit(second) {
+		t.Fatal("detached historical commit was fetched during a local containment check")
+	}
 	if err := transport.FetchStorageCommit(second); err != nil {
 		t.Fatalf("fetch retained pre-root Storage commit: %v", err)
+	}
+	if !transport.ContainsStorageCommit(second) {
+		t.Fatal("explicitly fetched historical commit is not available locally")
 	}
 	if !transport.StorageHistoryContinues(first, second) {
 		t.Fatal("fetched pre-root Storage History omitted its parent")
