@@ -37,6 +37,13 @@ type PublishOptions struct {
 	Progress    ProgressFunc
 }
 
+// Bound fragmentation while leaving tiny snapshots and isolated large updates incremental.
+const (
+	maximumLivePackPayloads           = 32
+	minimumByteCompactionPackPayloads = 8
+	minimumAddedCiphertextBytes       = 1 << 20
+)
+
 // RekeyPlan is the complete local authority selected before destructive
 // confirmation.
 type RekeyPlan struct {
@@ -987,8 +994,7 @@ func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat
 		repository.CompactedSize = 0
 		repository.AddedSinceCompaction = 0
 	}
-	halfCompactedSize := repository.CompactedSize/2 + repository.CompactedSize%2
-	compactionDue := legacyCompactionDue || len(packs) > 32 || repository.CompactedSize > 0 && repository.AddedSinceCompaction >= halfCompactedSize
+	compactionDue := automaticCompactionDue(repository, len(packs), legacyCompactionDue)
 	rootPublication := false
 	if compactionDue && options.AutoCompact && len(state.LogicalRefs) > 0 {
 		encoded, err = engine.buildCompactedSnapshot(logicalGitDirectory, repository, secret, options.Progress)
@@ -1044,6 +1050,17 @@ func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat
 		return fmt.Errorf("remove completed crash journal: %w", err)
 	}
 	return nil
+}
+
+func automaticCompactionDue(repository cloakformat.SnapshotState, livePackCount int, legacyCompactionDue bool) bool {
+	if legacyCompactionDue || livePackCount > maximumLivePackPayloads {
+		return true
+	}
+	if livePackCount < minimumByteCompactionPackPayloads || repository.CompactedSize == 0 || repository.AddedSinceCompaction < minimumAddedCiphertextBytes {
+		return false
+	}
+	halfCompactedSize := repository.CompactedSize/2 + repository.CompactedSize%2
+	return repository.AddedSinceCompaction >= halfCompactedSize
 }
 
 // FetchInto imports authenticated native packs into an existing Git object database.

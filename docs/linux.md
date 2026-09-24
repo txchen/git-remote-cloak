@@ -30,7 +30,7 @@ git-remote-cloak version --json
 git-remote-cloak version --formats
 ```
 
-For release `v0.2.2`, expect Linux amd64, CGo disabled, and exact read/write support for format v1.0.
+For release `v0.3.0`, expect Linux amd64, CGo disabled, and exact read/write support for format v1.0.
 
 ### Manual installation
 
@@ -38,7 +38,7 @@ The installer is optional. To install Linux x86-64 manually, download into a fre
 directory, verify the archive, and put the executable on `PATH`:
 
 ```sh
-version=v0.2.2
+version=v0.3.0
 curl -fLO "https://github.com/txchen/git-remote-cloak/releases/download/${version}/checksums.txt"
 curl -fLO "https://github.com/txchen/git-remote-cloak/releases/download/${version}/git-remote-cloak_${version}_linux_amd64.tar.gz"
 sha256sum --check --ignore-missing checksums.txt
@@ -145,9 +145,28 @@ git-remote-cloak doctor https://github.com/OWNER/REPOSITORY.git --json
 
 ## Maintenance
 
+Automatic Compaction is enabled by default. An ordinary push compacts before it
+would create a thirty-third live Pack Payload. It also compacts when the new
+snapshot has at least eight live Pack Payloads and ciphertext added since the
+last Compaction reaches both 1 MiB and 50% of the previous compacted snapshot
+size. Compaction runs during the push, rebuilds the reachable Logical Repository
+as one encrypted pack, and replaces the visible Storage History with a new root
+commit. It preserves the original branches, commits, and Recovery Secret. A
+repository with legacy Compaction metadata may compact once to establish a new
+baseline.
+
 Compact live ciphertext while preserving the Recovery Secret and Logical Repository:
 
 ```sh
+git-remote-cloak compact backup
+```
+
+To schedule Compaction yourself, disable the automatic trigger for that local
+remote and run `compact` when convenient. Pushes that exceed a threshold report
+a capacity warning while automatic Compaction is disabled:
+
+```sh
+git config remote.backup.cloakAutoCompact false
 git-remote-cloak compact backup
 ```
 

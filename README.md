@@ -2,7 +2,7 @@
 
 `git-remote-cloak` stores a private Git backup on an ordinary Repository Host without exposing original files, paths, commit messages, or branch names. The owner works in a normal Git repository; the host sees one `cloak-storage` branch containing opaque ciphertext.
 
-Binary version `v0.2.2` writes Ciphertext Repository format `v1.0`. These versions are independent. The current operationally verified target is Linux amd64.
+Binary version `v0.3.0` writes Ciphertext Repository format `v1.0`. These versions are independent. The current operationally verified target is Linux amd64.
 
 ## Install
 
@@ -30,7 +30,7 @@ Choose a version or an existing writable installation directory when needed:
 
 ```sh
 curl -fsSL https://github.com/txchen/git-remote-cloak/releases/latest/download/install.sh \
-  | CLOAK_VERSION=v0.2.2 CLOAK_INSTALL_DIR="$HOME/.local/bin" bash
+  | CLOAK_VERSION=v0.3.0 CLOAK_INSTALL_DIR="$HOME/.local/bin" bash
 ```
 
 To inspect the script first, download it to a file and run `bash install.sh` after
@@ -55,6 +55,11 @@ git push -u backup master
 ```
 
 Replace `master` with the current local branch name when necessary. The branch must contain at least one commit before it can be pushed.
+
+Hosted `cloak-storage` commits represent encrypted publications, not original
+Git commits. Automatic [Compaction](docs/linux.md#maintenance) may replace their
+visible history with one storage commit; recovery preserves the pushed original
+commits and branches.
 
 To investigate a slow or failed push, enable stage timings and aggregate counts for one command:
 

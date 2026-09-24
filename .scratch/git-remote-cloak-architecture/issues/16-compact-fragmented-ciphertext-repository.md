@@ -10,7 +10,7 @@
 - [x] The shared Snapshot Rebuild path restores the candidate, compares every Logical Ref and reachable original Git object ID, confirms Logical HEAD, and runs `git fsck --full` before publication.
 - [x] Successful Compaction preserves the Recovery Secret, Repository ID, repository format, Logical Refs, Logical HEAD, and original Git object IDs while increasing generation and publishing a parentless Storage History root.
 - [x] New immutable ciphertext uploads before a compare-and-swap force-re-root; interruption or concurrent remote change leaves the previous Storage Ref authoritative.
-- [x] Automatic Compaction runs synchronously before the push that would create a thirty-third live Pack Payload or reach 50% of the previous compacted snapshot size in added ciphertext.
+- [x] Automatic Compaction runs synchronously before the push that would create a thirty-third live Pack Payload. The byte trigger also requires eight live Pack Payloads, 1 MiB of added ciphertext, and 50% of the previous compacted snapshot size.
 - [x] A service can disable automatic Compaction, run it in a maintenance window, and receive explicit capacity warnings when pushes continue beyond a threshold.
 - [x] Progress distinguishes packing, encryption, upload, validation, and publication without exposing Protected Plaintext.
 - [x] The deterministic Markdown-heavy benchmark records fragmented, compacted, Storage History, and transfer measurements for the Go implementation and demonstrates one live Pack Payload after Compaction.
@@ -20,3 +20,5 @@
 ## Comments
 
 Implemented with authenticated v1 compaction baseline counters and a shared validated rebuild path. The deterministic Go benchmark fixture measured a 1.109x compacted-live/ordinary-pack ratio, 108,356 fragmented live bytes, 72,621 compacted live bytes, 121,924 fragmented Storage History bytes, 73,291 compacted Storage History bytes, and 111,173 cumulative transferred ciphertext bytes for this workload; these figures are workload evidence, not a universal guarantee.
+
+2026-09-24: The original relative-only byte trigger was too eager for tiny repositories and isolated large additions. The revised floors and production observations are recorded in [the automatic Compaction policy study](../research/04-automatic-compaction-policy.md).

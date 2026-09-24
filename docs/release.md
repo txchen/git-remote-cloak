@@ -40,6 +40,10 @@ The accepted `v0.1.0` release gate is:
 
 Broader GitHub/GitLab × SSH/HTTPS certification remains available through the [provider certification runbook](provider-certification.md), but is outside the current `v0.1.0` support claim.
 
+## v0.3.0 changes
+
+Automatic Compaction now waits until a push would create a thirty-third live Pack Payload, or until the snapshot has at least eight live Pack Payloads and added ciphertext reaches both 1 MiB and half the previous compacted snapshot size. Small incremental pushes and isolated large additions remain incremental. Manual Compaction and the Ciphertext Repository format are unchanged. This release also includes the filtered Storage Transport optimization and opt-in diagnostic logging from v0.2.2.
+
 ## v0.2.2 changes
 
 Filtered Storage Transport clones now batch missing ciphertext blob fetches, reducing repeated network sessions during push inspection. Set `CLOAK_LOG=debug` on a Git or Cloak command to print stage timings and aggregate object counts to stderr for diagnosis. The diagnostic logger does not emit Recovery Secrets, Protected Plaintext, Git arguments, or Repository Host URLs. Ciphertext Repository format remains v1.0.

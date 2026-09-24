@@ -705,8 +705,13 @@ Storage History with a parentless Storage commit.
 Automatic Compaction runs synchronously before the logical push that would:
 
 - create the thirty-third live Pack Payload; or
-- make ciphertext added since the previous Compaction reach 50% of the
-  previous compacted snapshot size.
+- have at least eight live Pack Payloads **and** make ciphertext added since
+  the previous Compaction reach both 1 MiB and 50% of the previous compacted
+  snapshot size.
+
+The absolute and Pack Payload floors keep small repositories and isolated large
+updates from repeatedly forcing a full rebuild. The byte rule remains a
+capacity heuristic rather than an estimate of savings from Compaction.
 
 It is not a daemon. Services may configure:
 

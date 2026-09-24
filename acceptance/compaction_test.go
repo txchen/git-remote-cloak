@@ -2,6 +2,8 @@ package acceptance_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,10 +27,7 @@ func TestCompactRebuildsOneValidatedParentlessSnapshot(t *testing.T) {
 	mustGit(t, owner, "config", "remote.backup.cloakAutoCompact", "false")
 	mustCloakGit(t, binary, owner, "push", "backup", "main")
 	writeAndCommit(t, owner, "second.md", strings.Repeat("## another heading\n\nmore private prose\n", 200), "second")
-	pushOutput := mustCloakGit(t, binary, owner, "push", "backup", "main")
-	if !strings.Contains(pushOutput, "automatic Compaction is disabled") {
-		t.Fatalf("push beyond disabled threshold omitted capacity warning:\n%s", pushOutput)
-	}
+	mustCloakGit(t, binary, owner, "push", "backup", "main")
 
 	wantRepositoryID := strings.TrimSpace(mustGit(t, owner, "config", "--get", "remote.backup.cloakRepositoryID"))
 	wantMain := strings.TrimSpace(mustGit(t, owner, "rev-parse", "refs/heads/main"))
@@ -86,23 +85,76 @@ func TestCompactRebuildsOneValidatedParentlessSnapshot(t *testing.T) {
 	}
 }
 
+func TestSmallIncrementalPushKeepsStorageHistoryLinear(t *testing.T) {
+	binary := buildBinary(t)
+	root := t.TempDir()
+	owner := filepath.Join(root, "owner")
+	clone := filepath.Join(root, "clone")
+	recovered := filepath.Join(root, "recovered")
+	host := filepath.Join(root, "host.git")
+	mustGit(t, root, "init", "--bare", host)
+	mustGit(t, root, "init", "-b", "main", owner)
+	writeAndCommit(t, owner, "file.txt", "first line\n", "first")
+	mustInit(t, binary, owner, host, testMnemonic)
+	mustCloakGit(t, binary, owner, "push", "backup", "main")
+	if got := storageHistoryLength(t, host); got != 2 {
+		t.Fatalf("initial Storage History length = %d, want init and first push", got)
+	}
+
+	mustCloakGit(t, binary, root, "clone", "cloak::"+host, clone)
+	writeAndCommit(t, clone, "file.txt", "first line\nsecond line\n", "second")
+	mustCloakGit(t, binary, clone, "push", "origin", "main")
+	if got := storageHistoryLength(t, host); got != 3 {
+		t.Fatalf("small incremental push rewrote Storage History: got %d commits, want 3", got)
+	}
+	mustCloakGit(t, binary, root, "clone", "cloak::"+host, recovered)
+	if got := strings.TrimSpace(mustGit(t, recovered, "rev-list", "--count", "HEAD")); got != "2" {
+		t.Fatalf("recovered Logical Repository has %s commits, want 2", got)
+	}
+}
+
 func TestPushAutomaticallyCompactsAtAddedCiphertextThreshold(t *testing.T) {
 	binary := buildBinary(t)
 	root := t.TempDir()
 	owner := filepath.Join(root, "owner")
+	recovered := filepath.Join(root, "recovered")
 	host := filepath.Join(root, "host.git")
 	mustGit(t, root, "init", "--bare", host)
 	mustGit(t, root, "init", "-b", "main", owner)
-	writeAndCommit(t, owner, "first.md", strings.Repeat("# deterministic markdown\n\ninitial paragraph\n", 300), "first")
+	contents := syntheticCompactionBytes(192<<10, 0)
+	writeAndCommit(t, owner, "document.bin", string(contents), "first")
 	mustInit(t, binary, owner, host, testMnemonic)
 	mustGit(t, owner, "config", "remote.backup.cloakAutoCompact", "true")
 	mustCloakGit(t, binary, owner, "push", "backup", "main")
-	writeAndCommit(t, owner, "second.md", strings.Repeat("# deterministic markdown\n\nsecond paragraph\n", 300), "second")
-
-	output := mustCloakGit(t, binary, owner, "push", "backup", "main")
-	for _, phase := range []string{"Packing", "Encryption", "Upload", "Validation", "Publication"} {
-		if !strings.Contains(output, phase) {
-			t.Fatalf("automatic Compaction output omits %s:\n%s", phase, output)
+	for revision := 1; revision <= 8; revision++ {
+		start := (revision - 1) * (16 << 10)
+		copy(contents[start:start+(16<<10)], syntheticCompactionBytes(16<<10, uint64(revision)))
+		writeAndCommit(t, owner, "document.bin", string(contents), fmt.Sprintf("revision %d", revision))
+		if revision == 7 {
+			mustGit(t, owner, "config", "remote.backup.cloakAutoCompact", "false")
+		} else if revision == 8 {
+			mustGit(t, owner, "config", "remote.backup.cloakAutoCompact", "true")
+		}
+		output := mustCloakGit(t, binary, owner, "push", "backup", "main")
+		if revision < 7 {
+			if got, want := storageHistoryLength(t, host), 2+revision; got != want {
+				t.Fatalf("revision %d compacted before eight live Pack Payloads: got %d Storage commits, want %d", revision, got, want)
+			}
+			continue
+		}
+		if revision == 7 {
+			if !strings.Contains(output, "automatic Compaction is disabled") {
+				t.Fatalf("push beyond disabled threshold omitted capacity warning:\n%s", output)
+			}
+			if got := storageHistoryLength(t, host); got != 9 {
+				t.Fatalf("disabled Compaction changed Storage History length to %d, want 9", got)
+			}
+			continue
+		}
+		for _, phase := range []string{"Packing", "Encryption", "Upload", "Validation", "Publication"} {
+			if !strings.Contains(output, phase) {
+				t.Fatalf("automatic Compaction output omits %s:\n%s", phase, output)
+			}
 		}
 	}
 	if got := storageHistoryLength(t, host); got != 1 {
@@ -111,6 +163,41 @@ func TestPushAutomaticallyCompactsAtAddedCiphertextThreshold(t *testing.T) {
 	if got := len(ciphertextObjectPaths(t, host)); got != 3 {
 		t.Fatalf("automatic Compaction left %d ciphertext objects, want one Pack Payload", got)
 	}
+	mustCloakGit(t, binary, root, "clone", "cloak::"+host, recovered)
+	if got, want := mustGit(t, recovered, "rev-list", "--objects", "--all"), mustGit(t, owner, "rev-list", "--objects", "--all"); got != want {
+		t.Fatalf("automatic Compaction changed the recovered Logical Repository")
+	}
+}
+
+func TestSingleLargePushDoesNotAutomaticallyCompact(t *testing.T) {
+	binary := buildBinary(t)
+	root := t.TempDir()
+	owner := filepath.Join(root, "owner")
+	host := filepath.Join(root, "host.git")
+	mustGit(t, root, "init", "--bare", host)
+	mustGit(t, root, "init", "-b", "main", owner)
+	writeAndCommit(t, owner, "notes.md", "first line\n", "first")
+	mustInit(t, binary, owner, host, testMnemonic)
+	mustGit(t, owner, "config", "remote.backup.cloakAutoCompact", "true")
+	mustCloakGit(t, binary, owner, "push", "backup", "main")
+
+	writeAndCommit(t, owner, "large.bin", string(syntheticCompactionBytes(2<<20, 1)), "large addition")
+	mustCloakGit(t, binary, owner, "push", "backup", "main")
+	if got := storageHistoryLength(t, host); got != 3 {
+		t.Fatalf("one large addition rewrote Storage History: got %d commits, want 3", got)
+	}
+}
+
+func syntheticCompactionBytes(size int, seed uint64) []byte {
+	contents := make([]byte, size)
+	var input [16]byte
+	binary.LittleEndian.PutUint64(input[:8], seed)
+	for offset := 0; offset < len(contents); offset += sha256.Size {
+		binary.LittleEndian.PutUint64(input[8:], uint64(offset))
+		digest := sha256.Sum256(input[:])
+		copy(contents[offset:], digest[:])
+	}
+	return contents
 }
 
 func TestStaleCheckpointAcceptsAuthenticatedCompactionReRootChain(t *testing.T) {
@@ -129,6 +216,7 @@ func TestStaleCheckpointAcceptsAuthenticatedCompactionReRootChain(t *testing.T) 
 
 	writeAndCommit(t, owner, "second.md", strings.Repeat("# second\n\nreplacement paragraph\n", 300), "second")
 	mustCloakGit(t, binary, owner, "push", "backup", "main")
+	mustRunWithRepositorySecret(t, binary, owner, binary, "compact", "backup")
 	writeAndCommit(t, owner, "third.md", "third publication after Compaction\n", "third")
 	mustCloakGit(t, binary, owner, "push", "backup", "main")
 
