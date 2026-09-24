@@ -35,6 +35,7 @@ func TestOptInDiagnosticsExplainPushWithoutLoggingProtectedInputs(t *testing.T) 
 			"cloak debug +", "remote helper invoked", "recovery secret loaded", "remote helper started", "remote inspection started",
 			"storage clone started", "storage clone ended after",
 			"storage blob prefetch started", "missing storage blobs=",
+			"rollback checkpoint started", "snapshot cache update started", "transaction journal reconciliation started",
 			"snapshot decode ended after", "remote inspection completed",
 		} {
 			if !strings.Contains(log, marker) {

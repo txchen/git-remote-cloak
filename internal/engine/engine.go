@@ -1326,13 +1326,20 @@ func (engine *Engine) decodeTransportSnapshotBytes(secret domain.RecoverySecret,
 	diagnostics.Count("ciphertext blobs read", len(downloaded))
 	if observe {
 		continuity := engine.authenticatedStorageHistoryContinuity(secret, transport, decoded.Repository)
-		if err := localstate.ObserveCheckpoint(engine.localGitDirectory, decoded.Repository.RepositoryID, decoded.Repository.Generation, storageCommitID, decoded.Repository.PreviousStorageRef, continuity); err != nil {
+		checkpointDone := diagnostics.Stage("rollback checkpoint")
+		err := localstate.ObserveCheckpoint(engine.localGitDirectory, decoded.Repository.RepositoryID, decoded.Repository.Generation, storageCommitID, decoded.Repository.PreviousStorageRef, continuity)
+		checkpointDone()
+		if err != nil {
 			return cloakformat.DecodedSnapshot{}, err
 		}
 	}
 	// Cache failure can reduce performance but cannot change recoverability.
+	cacheDone := diagnostics.Stage("snapshot cache update")
 	_ = cache.StoreSnapshot(storageCommitID, bootstrap, downloaded)
+	cacheDone()
+	journalDone := diagnostics.Stage("transaction journal reconciliation")
 	localstate.ReconcileTransactions(engine.localGitDirectory, secret, decoded.Repository.RepositoryID, storageCommitID, transport.ContainsStorageCommit)
+	journalDone()
 	return decoded, nil
 }
 

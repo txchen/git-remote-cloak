@@ -57,10 +57,18 @@ func ObserveCheckpoint(gitDirectory string, repositoryID domain.RepositoryID, ge
 	if err := CheckCheckpoint(gitDirectory, repositoryID, generation, storageCommitID, previousStorageCommitID, storageHistoryContinues); err != nil {
 		return err
 	}
-	return storeCheckpoint(gitDirectory, Checkpoint{
+	desired := Checkpoint{
 		Version: checkpointVersion, RepositoryID: hex.EncodeToString(repositoryID[:]),
 		HighestAuthenticatedGeneration: generation, LastSeenStorageCommitID: storageCommitID,
-	})
+	}
+	current, exists, err := LoadCheckpoint(gitDirectory)
+	if err != nil {
+		return err
+	}
+	if exists && current == desired && privateRegularFile(checkpointPath(gitDirectory)) {
+		return nil
+	}
+	return storeCheckpoint(gitDirectory, desired)
 }
 
 // CheckCheckpoint fails closed when an authenticated snapshot contradicts

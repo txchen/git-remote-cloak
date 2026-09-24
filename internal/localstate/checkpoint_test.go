@@ -157,6 +157,37 @@ func TestRollbackCheckpointAcceptsExplainedStorageHistoryContinuation(t *testing
 	}
 }
 
+func TestUnchangedCheckpointDoesNotRewritePrivateFile(t *testing.T) {
+	gitDirectory := t.TempDir()
+	repositoryID := domain.RepositoryID{1, 2, 3, 4}
+	commitID := strings.Repeat("a", 40)
+	observe := func() {
+		t.Helper()
+		if err := ObserveCheckpoint(gitDirectory, repositoryID, 1, commitID, "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	observe()
+	path := checkpointPath(gitDirectory)
+	first, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observe()
+	second, err := os.Stat(path)
+	if err != nil || !os.SameFile(first, second) {
+		t.Fatalf("unchanged checkpoint was rewritten: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	observe()
+	repaired, err := os.Stat(path)
+	if err != nil || repaired.Mode().Perm() != 0o600 || os.SameFile(second, repaired) {
+		t.Fatalf("checkpoint permissions were not repaired: %v", err)
+	}
+}
+
 func TestDamagedRollbackCheckpointIsNotSilentlyDiscarded(t *testing.T) {
 	gitDirectory := t.TempDir()
 	path := filepath.Join(gitDirectory, "cloak", "state")

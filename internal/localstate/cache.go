@@ -1,6 +1,7 @@
 package localstate
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base32"
 	"errors"
@@ -76,9 +77,20 @@ func (cache *Cache) StoreSnapshot(storageCommitID string, bootstrap []byte, obje
 		}
 	}
 	if storageCommitID != "" && isLowercaseAlphanumeric(storageCommitID) {
-		return atomicWrite(filepath.Join(cache.root, "snapshots", storageCommitID, "bootstrap"), bootstrap)
+		path := filepath.Join(cache.root, "snapshots", storageCommitID, "bootstrap")
+		if privateRegularFile(path) {
+			if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, bootstrap) {
+				return nil
+			}
+		}
+		return atomicWrite(path, bootstrap)
 	}
 	return nil
+}
+
+func privateRegularFile(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm() == 0o600
 }
 
 func atomicWrite(path string, contents []byte) error {
