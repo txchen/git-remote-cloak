@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/txchen/git-remote-cloak/internal/diagnostics"
 	"github.com/txchen/git-remote-cloak/internal/domain"
 	"github.com/txchen/git-remote-cloak/internal/engine"
 	cloakformat "github.com/txchen/git-remote-cloak/internal/format"
@@ -96,10 +97,12 @@ func isConfiguredHelperInvocation(arguments []string) bool {
 }
 
 func runRemoteHelper(arguments []string) error {
+	diagnostics.Event("remote helper invoked")
 	recoverySecret, err := acquireRepositorySecret("", false)
 	if err != nil {
 		return err
 	}
+	diagnostics.Event("recovery secret loaded")
 	autoCompact, err := remoteAutoCompact(arguments[0])
 	if err != nil {
 		return err

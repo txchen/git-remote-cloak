@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/txchen/git-remote-cloak/internal/diagnostics"
 	"github.com/txchen/git-remote-cloak/internal/gitexec"
 )
 
@@ -30,6 +31,7 @@ var (
 
 // OpenGit clones the Repository Host through ordinary Git transport into restrictive local storage.
 func OpenGit(repositoryURL string) (*Git, error) {
+	defer diagnostics.Stage("storage clone")()
 	if repositoryURL == "" {
 		return nil, fmt.Errorf("Repository Host URL is required")
 	}
@@ -64,6 +66,7 @@ func (transport *Git) Close() error {
 // PrefetchSnapshotBlobs fetches blobs absent from a filtered clone in batches.
 // Cached ciphertext can be read later without downloading its Git blob.
 func (transport *Git) PrefetchSnapshotBlobs(storageCommitID string, hasCachedObject func(string) bool) error {
+	defer diagnostics.Stage("storage blob prefetch")()
 	if !validStorageCommitID(storageCommitID) || storageCommitID == transport.zeroObject {
 		return errors.New("invalid Storage commit ID")
 	}
@@ -78,13 +81,16 @@ func (transport *Git) PrefetchSnapshotBlobs(storageCommitID string, hasCachedObj
 		}
 	}
 	if len(missing) == 0 {
+		diagnostics.Count("missing storage blobs", 0)
 		return nil
 	}
+	diagnostics.Count("missing storage blobs", len(missing))
 	tree, err := runGit(transport.path, nil, "ls-tree", "-r", "-z", storageCommitID)
 	if err != nil {
 		return err
 	}
 	objectIDs := make([]string, 0, len(missing))
+	cached := 0
 	for _, entry := range strings.Split(string(tree), "\x00") {
 		metadata, path, found := strings.Cut(entry, "\t")
 		if !found {
@@ -96,19 +102,27 @@ func (transport *Git) PrefetchSnapshotBlobs(storageCommitID string, hasCachedObj
 		}
 		if path != "bootstrap" {
 			locator, ok := strings.CutPrefix(path, "objects/")
-			if !ok || locator == "" || strings.Contains(locator, "/") || hasCachedObject != nil && hasCachedObject(locator) {
+			if !ok || locator == "" || strings.Contains(locator, "/") {
+				continue
+			}
+			if hasCachedObject != nil && hasCachedObject(locator) {
+				cached++
 				continue
 			}
 		}
 		objectIDs = append(objectIDs, fields[2])
 		delete(missing, fields[2])
 	}
+	diagnostics.Count("cached storage blobs", cached)
+	diagnostics.Count("storage blobs to fetch", len(objectIDs))
 	for start := 0; start < len(objectIDs); start += 512 {
 		end := min(start+512, len(objectIDs))
 		arguments := append([]string{"fetch", "--no-tags", "origin"}, objectIDs[start:end]...)
+		diagnostics.Event("storage blob fetch started")
 		if _, err := runGit(transport.path, nil, arguments...); err != nil {
 			return err
 		}
+		diagnostics.Event("storage blob fetch completed")
 	}
 	return nil
 }
@@ -134,6 +148,7 @@ func (transport *Git) PrepareRootSnapshot(expectedStorageCommitID string, bootst
 // PublishPrepared uploads a prepared immutable Storage commit and updates the
 // Storage Ref. Transient transport failures receive at most three attempts.
 func (transport *Git) PublishPrepared(expectedStorageCommitID, commitID string) error {
+	defer diagnostics.Stage("storage ref publication")()
 	if err := waitAtTestStorageRefBarrier(); err != nil {
 		return err
 	}
@@ -162,11 +177,13 @@ func (transport *Git) PublishPrepared(expectedStorageCommitID, commitID string) 
 	}
 	var lastError error
 	for attempt := 0; attempt < 3; attempt++ {
+		diagnostics.Count("storage publication attempt", attempt+1)
 		if os.Getenv("CLOAK_TEST_FAULT") == "immutable-upload-failure" {
 			lastError = errors.New("injected immutable-object upload failure")
 			continue
 		}
 		if _, err := runGit(transport.path, nil, "push", lease, "origin", commitID+":"+StorageRef); err == nil {
+			diagnostics.Event("storage ref publication accepted")
 			if os.Getenv("CLOAK_TEST_FAULT") == "after-storage-ref" {
 				return errors.New("injected lost response after Storage Ref publication")
 			}

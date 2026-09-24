@@ -30,7 +30,7 @@ git-remote-cloak version --json
 git-remote-cloak version --formats
 ```
 
-For release `v0.2.1`, expect Linux amd64, CGo disabled, and exact read/write support for format v1.0.
+For release `v0.2.2`, expect Linux amd64, CGo disabled, and exact read/write support for format v1.0.
 
 ### Manual installation
 
@@ -38,7 +38,7 @@ The installer is optional. To install Linux x86-64 manually, download into a fre
 directory, verify the archive, and put the executable on `PATH`:
 
 ```sh
-version=v0.2.1
+version=v0.2.2
 curl -fLO "https://github.com/txchen/git-remote-cloak/releases/download/${version}/checksums.txt"
 curl -fLO "https://github.com/txchen/git-remote-cloak/releases/download/${version}/git-remote-cloak_${version}_linux_amd64.tar.gz"
 sha256sum --check --ignore-missing checksums.txt
@@ -107,6 +107,17 @@ Inspect the trusted local Rollback Checkpoint:
 git-remote-cloak status
 git-remote-cloak status --json
 ```
+
+## Diagnose slow or failed operations
+
+Set `CLOAK_LOG=debug` for one command to print elapsed stage timings and aggregate counts to stderr:
+
+```sh
+CLOAK_LOG=debug git push backup main
+CLOAK_LOG=debug git fetch backup
+```
+
+For a push that pauses before `Packing`, inspect the `remote inspection`, `storage clone`, `storage blob prefetch`, and `snapshot decode` lines. A push with new commits also reports restoration, candidate validation, and Storage Ref publication. A no-change push ends after remote inspection. Debug output does not include the Recovery Secret, original file paths, commit messages, Logical Ref names, or Git command arguments. It does reveal operation timing and aggregate object counts. Ordinary Git or Repository Host errors may include additional details, so review captured stderr before sharing it.
 
 ## Recover on another host
 

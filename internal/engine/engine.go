@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/txchen/git-remote-cloak/internal/diagnostics"
 	"github.com/txchen/git-remote-cloak/internal/domain"
 	cloakformat "github.com/txchen/git-remote-cloak/internal/format"
 	"github.com/txchen/git-remote-cloak/internal/gitdb"
@@ -851,6 +852,7 @@ func reportProgress(progress ProgressFunc, phase string) {
 }
 
 func (engine *Engine) validateCandidate(secret domain.RecoverySecret, encoded cloakformat.EncodedSnapshot, state gitdb.State, reachableObjectIDs []string) (cloakformat.DecodedSnapshot, error) {
+	defer diagnostics.Stage("candidate validation")()
 	candidate, err := engine.formats.DecodeSnapshot(secret, encoded.Bootstrap, encoded.CiphertextObjects)
 	if err != nil {
 		return cloakformat.DecodedSnapshot{}, fmt.Errorf("validate candidate Ciphertext Snapshot: %w", err)
@@ -879,6 +881,7 @@ func (engine *Engine) validateCandidate(secret domain.RecoverySecret, encoded cl
 }
 
 func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat.DecodedSnapshot, storageCommitID, logicalGitDirectory string, secret domain.RecoverySecret, options PublishOptions) error {
+	defer diagnostics.Stage("push candidate")()
 	if err := engine.formats.RequireWriter(current.Repository.Format); err != nil {
 		return err
 	}
@@ -893,6 +896,7 @@ func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat
 	if err != nil {
 		return err
 	}
+	diagnostics.Count("reachable logical objects", len(reachableObjectIDs))
 	liveObjects := make(map[string]struct{}, len(reachableObjectIDs))
 	for _, objectID := range reachableObjectIDs {
 		liveObjects[objectID] = struct{}{}
@@ -920,6 +924,7 @@ func (engine *Engine) publishCurrent(transport *storage.Git, current cloakformat
 			newObjectIDs = append(newObjectIDs, objectID)
 		}
 	}
+	diagnostics.Count("new logical objects", len(newObjectIDs))
 	if err := gitdb.RejectLFSPointers(logicalGitDirectory, newObjectIDs); err != nil {
 		return err
 	}
@@ -1129,6 +1134,7 @@ func (engine *Engine) PublishRefsWithOptions(repositoryURL, sourceGitDirectory s
 }
 
 func (engine *Engine) publishRefAttempt(repositoryURL, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret, options PublishOptions) error {
+	defer diagnostics.Stage("push attempt")()
 	transport, err := storage.OpenGit(repositoryURL)
 	if err != nil {
 		return err
@@ -1144,6 +1150,7 @@ func (engine *Engine) publishRefAttempt(repositoryURL, sourceGitDirectory string
 	}
 	defer os.RemoveAll(temporaryRoot)
 	temporary := filepath.Join(temporaryRoot, "repository.git")
+	diagnostics.Event("logical repository restoration started")
 	if len(current.Repository.LogicalRefs) == 0 {
 		if _, err := makeEmptyBare(temporary, current.Repository); err != nil {
 			return err
@@ -1156,6 +1163,7 @@ func (engine *Engine) publishRefAttempt(repositoryURL, sourceGitDirectory string
 			return err
 		}
 	}
+	diagnostics.Event("logical repository restoration completed")
 	for _, update := range updates {
 		source, destination := update.Source, string(update.Destination)
 		if update.HasExpectedOld && current.Repository.LogicalRefs[destination] != update.ExpectedOld {
@@ -1177,6 +1185,7 @@ func (engine *Engine) publishRefAttempt(repositoryURL, sourceGitDirectory string
 			return fmt.Errorf("receive pushed Logical Ref: %s", strings.TrimSpace(string(output)))
 		}
 	}
+	diagnostics.Event("logical ref updates received")
 	return engine.publishCurrent(transport, current, storageCommitID, temporary, secret, options)
 }
 
@@ -1207,6 +1216,7 @@ type authenticatedSnapshot struct {
 }
 
 func (engine *Engine) readSnapshot(repositoryURL string, secret domain.RecoverySecret) (authenticatedSnapshot, error) {
+	defer diagnostics.Stage("read current snapshot")()
 	transport, err := storage.OpenGit(repositoryURL)
 	if err != nil {
 		return authenticatedSnapshot{}, err
@@ -1224,10 +1234,13 @@ func (engine *Engine) readSnapshot(repositoryURL string, secret domain.RecoveryS
 }
 
 func (engine *Engine) decodeTransportSnapshot(secret domain.RecoverySecret, transport *storage.Git) (cloakformat.DecodedSnapshot, string, error) {
+	defer diagnostics.Stage("snapshot decode")()
 	if storageCommitID, err := transport.Current(); err == nil {
 		// Some hosts reject explicit multi-object fetches; the bounded reads below
 		// remain the authoritative path when prefetch is unavailable.
-		_ = transport.PrefetchSnapshotBlobs(storageCommitID, localstate.NewCache(engine.localGitDirectory).HasObject)
+		if err := transport.PrefetchSnapshotBlobs(storageCommitID, localstate.NewCache(engine.localGitDirectory).HasObject); err != nil {
+			diagnostics.Event("storage blob prefetch unavailable; falling back to individual reads")
+		}
 	}
 	bootstrap, storageCommitID, err := transport.ReadBootstrap()
 	if err != nil {
@@ -1277,8 +1290,10 @@ func (engine *Engine) decodeTransportSnapshotAt(secret domain.RecoverySecret, tr
 func (engine *Engine) decodeTransportSnapshotBytes(secret domain.RecoverySecret, transport *storage.Git, bootstrap []byte, storageCommitID string, observe bool) (cloakformat.DecodedSnapshot, error) {
 	cache := localstate.NewCache(engine.localGitDirectory)
 	downloaded := make(map[string][]byte)
+	cacheHits := 0
 	decoded, err := engine.decodeValidatedSnapshot(secret, bootstrap, func(locator string) ([]byte, error) {
 		if cached, found := cache.ReadObject(locator); found {
+			cacheHits++
 			return cached, nil
 		}
 		contents, err := transport.ReadObject(storageCommitID, locator)
@@ -1290,6 +1305,8 @@ func (engine *Engine) decodeTransportSnapshotBytes(secret domain.RecoverySecret,
 	if err != nil {
 		return cloakformat.DecodedSnapshot{}, err
 	}
+	diagnostics.Count("ciphertext cache hits", cacheHits)
+	diagnostics.Count("ciphertext blobs read", len(downloaded))
 	if observe {
 		continuity := engine.authenticatedStorageHistoryContinuity(secret, transport, decoded.Repository)
 		if err := localstate.ObserveCheckpoint(engine.localGitDirectory, decoded.Repository.RepositoryID, decoded.Repository.Generation, storageCommitID, decoded.Repository.PreviousStorageRef, continuity); err != nil {

@@ -40,6 +40,10 @@ The accepted `v0.1.0` release gate is:
 
 Broader GitHub/GitLab × SSH/HTTPS certification remains available through the [provider certification runbook](provider-certification.md), but is outside the current `v0.1.0` support claim.
 
+## v0.2.2 changes
+
+Filtered Storage Transport clones now batch missing ciphertext blob fetches, reducing repeated network sessions during push inspection. Set `CLOAK_LOG=debug` on a Git or Cloak command to print stage timings and aggregate object counts to stderr for diagnosis. The diagnostic logger does not emit Recovery Secrets, Protected Plaintext, Git arguments, or Repository Host URLs. Ciphertext Repository format remains v1.0.
+
 ## v0.2.1 changes
 
 Storage History commits now use the invoking Git repository's configured author and committer identity, including repository-local `user.name` and `user.email`. Without configured identity, they retain the anonymous `git-remote-cloak <cloak@invalid>` default. Hosts that require a recognized email can accept Cloak publications without a Cloak-specific setting. Original Logical Repository commit identities remain encrypted and unchanged. The chosen outer identity is visible to the Repository Host. Ciphertext Repository format remains v1.0.

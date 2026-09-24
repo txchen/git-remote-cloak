@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/txchen/git-remote-cloak/internal/diagnostics"
 	"github.com/txchen/git-remote-cloak/internal/domain"
 	"github.com/txchen/git-remote-cloak/internal/engine"
 	"github.com/txchen/git-remote-cloak/internal/gitdb"
@@ -31,6 +32,7 @@ func Run(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Re
 
 // RunWithOptions serves a remote-helper session with an explicit maintenance policy.
 func RunWithOptions(repositoryURL string, recoverySecret domain.RecoverySecret, input io.Reader, output io.Writer, publishOptions engine.PublishOptions) error {
+	defer diagnostics.Stage("remote helper")()
 	repositoryEngine := engine.New()
 	if gitDirectory, err := currentGitDirectory(); err == nil {
 		if err := gitdb.RejectPromisorState(gitDirectory); err != nil {
@@ -38,10 +40,12 @@ func RunWithOptions(repositoryURL string, recoverySecret domain.RecoverySecret, 
 		}
 		repositoryEngine = engine.NewWithLocalState(gitDirectory)
 	}
+	diagnostics.Event("remote inspection started")
 	repository, err := repositoryEngine.Inspect(repositoryURL, recoverySecret)
 	if err != nil {
 		return err
 	}
+	diagnostics.Event("remote inspection completed")
 	reader := bufio.NewScanner(input)
 	writer := bufio.NewWriter(output)
 	inFetchBatch := false
@@ -156,6 +160,7 @@ func RunWithOptions(repositoryURL string, recoverySecret domain.RecoverySecret, 
 				return err
 			}
 		case command == "" && len(pushes) > 0:
+			diagnostics.Count("requested ref updates", len(pushes))
 			gitDirectory, err := currentGitDirectory()
 			if err == nil {
 				err = repositoryEngine.PublishRefsWithOptions(repositoryURL, gitDirectory, pushes, recoverySecret, publishOptions)
