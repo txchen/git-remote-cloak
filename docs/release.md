@@ -10,7 +10,7 @@ Git LFS and partial clones/promisor objects are rejected. Ordinary Git binary bl
 
 ## Security and operational limits
 
-The Repository Host can observe the fixed Storage Ref, public format capabilities, random Repository ID, ciphertext identifiers and sizes, Storage History topology and commit count, timing, change patterns, and repository growth. V1 does not hide traffic, sizes, or access patterns.
+The Repository Host can observe the fixed Storage Ref, public format capabilities, random Repository ID, ciphertext identifiers and sizes, Storage History commit identities, topology and commit count, timing, change patterns, and repository growth. V1 does not hide traffic, sizes, or access patterns.
 
 A fresh clone can authenticate a Ciphertext Snapshot but cannot prove that it is the newest valid Ciphertext Snapshot. Known rollback is detected only after an Authorized Host has retained a trusted Rollback Checkpoint. Host availability, quotas, authentication, branch protection, history retention, and garbage collection remain provider concerns. Compaction, Rekey, deletion, and Format Migration cannot guarantee that a Repository Host erases superseded ciphertext or immediately returns quota.
 
@@ -39,6 +39,10 @@ The accepted `v0.1.0` release gate is:
 5. Download the published assets, verify every checksum, and run the published Linux amd64 binary.
 
 Broader GitHub/GitLab × SSH/HTTPS certification remains available through the [provider certification runbook](provider-certification.md), but is outside the current `v0.1.0` support claim.
+
+## v0.2.1 changes
+
+Storage History commits now use the invoking Git repository's configured author and committer identity, including repository-local `user.name` and `user.email`. Hosts that require a recognized email can accept Cloak publications without a Cloak-specific setting. Original Logical Repository commit identities remain encrypted and unchanged. The chosen outer identity is visible to the Repository Host. Ciphertext Repository format remains v1.0.
 
 ## v0.2.0 changes
 

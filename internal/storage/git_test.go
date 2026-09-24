@@ -5,8 +5,45 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestStorageCommitUsesConfiguredGitIdentity(t *testing.T) {
+	root := t.TempDir()
+	hostPath := filepath.Join(root, "host.git")
+	if output, err := exec.Command("git", "init", "--bare", hostPath).CombinedOutput(); err != nil {
+		t.Fatalf("initialize host: %v\n%s", err, output)
+	}
+	hook := "#!/bin/sh\nwhile read old new ref; do\n  email=$(git show -s --format=%ce \"$new\")\n  if [ \"$email\" != 'owner@corp.example' ]; then\n    echo \"committer email $email is not recognized\" >&2\n    exit 1\n  fi\ndone\n"
+	if err := os.WriteFile(filepath.Join(hostPath, "hooks", "pre-receive"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "gitconfig")
+	if err := os.WriteFile(configPath, []byte("[user]\n\tname = Owner\n\temail = owner@corp.example\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", configPath)
+	transport, err := OpenGit(hostPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+	zero, err := transport.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitID, err := transport.PublishSnapshot(zero, []byte("bootstrap"), map[string][]byte{"ciphertext": []byte("protected")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []string{"%ae", "%ce"} {
+		output, err := exec.Command("git", "--git-dir="+hostPath, "show", "-s", "--format="+format, commitID).CombinedOutput()
+		if err != nil || strings.TrimSpace(string(output)) != "owner@corp.example" {
+			t.Fatalf("Storage commit email %s = %q, err=%v", format, output, err)
+		}
+	}
+}
 
 func TestStorageCommandsIgnoreCallerRepositoryPaths(t *testing.T) {
 	root := t.TempDir()

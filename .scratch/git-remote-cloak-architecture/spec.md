@@ -83,6 +83,7 @@ The Repository Host may observe:
 - public format and capability metadata;
 - a random Repository ID;
 - ciphertext object identifiers and sizes;
+- Storage History commit author and committer identities;
 - Storage History topology and commit count;
 - upload and access timing;
 - ciphertext change patterns; and

@@ -10,6 +10,55 @@ import (
 
 const testMnemonic = "cloak-v1:abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
 
+func TestInitUsesWorkspaceGitIdentityForStorageCommit(t *testing.T) {
+	binary := buildBinary(t)
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace")
+	host := filepath.Join(root, "host.git")
+	mustGit(t, root, "init", "--bare", host)
+	mustGit(t, root, "init", "-b", "main", workspace)
+	mustGit(t, workspace, "config", "user.name", "Workspace Owner")
+	mustGit(t, workspace, "config", "user.email", "owner@corp.example")
+	globalConfig := filepath.Join(root, "empty-gitconfig")
+	if err := os.WriteFile(globalConfig, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hook := "#!/bin/sh\nwhile read old new ref; do\n  email=$(git show -s --format=%ce \"$new\")\n  if [ \"$email\" != 'owner@corp.example' ]; then\n    echo \"committer email $email is not recognized\" >&2\n    exit 1\n  fi\ndone\n"
+	if err := os.WriteFile(filepath.Join(host, "hooks", "pre-receive"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(binary, "init", "backup", host)
+	command.Dir = workspace
+	command.Env = append(withoutEnvironment(os.Environ(),
+		"CLOAK_RECOVERY_SECRET", "CLOAK_RECOVERY_SECRET_FILE",
+		"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+	), "CLOAK_RECOVERY_SECRET="+testMnemonic, "GIT_CONFIG_GLOBAL="+globalConfig)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("init with workspace Git identity failed: %v\n%s", err, output)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "private.txt"), []byte("protected\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, workspace, "add", "private.txt")
+	mustGit(t, workspace, "commit", "-m", "logical commit by another author")
+	push := exec.Command("git", "push", "backup", "main")
+	push.Dir = workspace
+	push.Env = append(withoutEnvironment(os.Environ(),
+		"CLOAK_RECOVERY_SECRET", "CLOAK_RECOVERY_SECRET_FILE",
+		"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+	), "CLOAK_RECOVERY_SECRET="+testMnemonic, "GIT_CONFIG_GLOBAL="+globalConfig,
+		"PATH="+filepath.Dir(binary)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if output, err := push.CombinedOutput(); err != nil {
+		t.Fatalf("push with workspace Git identity failed: %v\n%s", err, output)
+	}
+	for _, format := range []string{"%an <%ae>", "%cn <%ce>"} {
+		got := mustGit(t, host, "show", "-s", "--format="+format, "refs/heads/cloak-storage")
+		if strings.TrimSpace(got) != "Workspace Owner <owner@corp.example>" {
+			t.Fatalf("Storage commit identity = %q", got)
+		}
+	}
+}
+
 func TestOwnerInitializesAndRecoversEmptyCiphertextRepository(t *testing.T) {
 	binary := buildBinary(t)
 	root := t.TempDir()

@@ -271,13 +271,12 @@ func runGit(gitDirectory string, stdin []byte, arguments ...string) ([]byte, err
 	fullArguments := append([]string{"--git-dir=" + gitDirectory}, arguments...)
 	command := exec.Command("git", fullArguments...)
 	command.Env = append(gitexec.Environment(os.Environ()),
-		"GIT_AUTHOR_NAME=git-remote-cloak",
-		"GIT_AUTHOR_EMAIL=cloak@invalid",
-		"GIT_COMMITTER_NAME=git-remote-cloak",
-		"GIT_COMMITTER_EMAIL=cloak@invalid",
 		"GIT_AUTHOR_DATE=2000-01-01T00:00:00Z",
 		"GIT_COMMITTER_DATE=2000-01-01T00:00:00Z",
 	)
+	if len(arguments) > 0 && arguments[0] == "commit-tree" {
+		command.Env = appendCallerGitIdentity(command.Env)
+	}
 	if stdin != nil {
 		command.Stdin = bytes.NewReader(stdin)
 	}
@@ -289,4 +288,33 @@ func runGit(gitDirectory string, stdin []byte, arguments ...string) ([]byte, err
 		return nil, err
 	}
 	return output, nil
+}
+
+// The Storage Transport writes commits in a temporary bare clone. Copy the
+// caller's repository-local identity into that clone; inherited GIT_* identity
+// variables and Git's global configuration keep their normal precedence.
+func appendCallerGitIdentity(environment []string) []string {
+	for _, setting := range []struct {
+		key       string
+		variables []string
+	}{
+		{"user.name", []string{"GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"}},
+		{"user.email", []string{"GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"}},
+	} {
+		command := exec.Command("git", "config", "--get", setting.key)
+		output, err := command.Output()
+		if err != nil {
+			continue
+		}
+		value := strings.TrimSpace(string(output))
+		if value == "" {
+			continue
+		}
+		for _, variable := range setting.variables {
+			if _, set := os.LookupEnv(variable); !set {
+				environment = append(environment, variable+"="+value)
+			}
+		}
+	}
+	return environment
 }
