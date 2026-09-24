@@ -25,8 +25,8 @@ func TestIncrementalPushFetchPullAndUserMergeRoundTrip(t *testing.T) {
 	mustCloakGit(t, binary, root, "clone", "cloak::"+repositoryHost, secondHost)
 
 	writeAndCommit(t, owner, "owner.txt", "owner change\n", "owner change")
-	mustCloakGit(t, binary, owner, "push", "backup", "main")
-	mustCloakGit(t, binary, secondHost, "fetch", "origin")
+	mustCloakGitWithSingleInspection(t, binary, owner, "push", "backup", "main")
+	mustCloakGitWithSingleInspection(t, binary, secondHost, "fetch", "origin")
 	if got, want := mustGit(t, secondHost, "rev-parse", "origin/main"), mustGit(t, owner, "rev-parse", "main"); got != want {
 		t.Fatalf("fetched main = %q, want %q", got, want)
 	}
@@ -34,7 +34,7 @@ func TestIncrementalPushFetchPullAndUserMergeRoundTrip(t *testing.T) {
 	writeAndCommit(t, secondHost, "second.txt", "second host change\n", "second host change")
 	writeAndCommit(t, owner, "later.txt", "later owner change\n", "later owner change")
 	mustCloakGit(t, binary, owner, "push", "backup", "main")
-	mustCloakGit(t, binary, secondHost, "pull", "--no-rebase", "origin", "main")
+	mustCloakGitWithSingleInspection(t, binary, secondHost, "pull", "--no-rebase", "origin", "main")
 	if parents := mustGit(t, secondHost, "rev-list", "--parents", "-n", "1", "HEAD"); len(strings.Fields(parents)) != 3 {
 		t.Fatalf("pull did not create the user-requested merge commit: %q", parents)
 	}
@@ -50,6 +50,21 @@ func TestIncrementalPushFetchPullAndUserMergeRoundTrip(t *testing.T) {
 	if output, err := exec.Command("git", "-C", freshRecovery, "fsck", "--full").CombinedOutput(); err != nil {
 		t.Fatalf("fresh recovery fails fsck: %v\n%s", err, output)
 	}
+}
+
+func mustCloakGitWithSingleInspection(t *testing.T, binary, directory string, arguments ...string) string {
+	t.Helper()
+	command := exec.Command("git", arguments...)
+	command.Dir = directory
+	command.Env = append(cloakGitEnvironment(binary), "CLOAK_LOG=debug")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed: %v\n%s", arguments, err, output)
+	}
+	if got := strings.Count(string(output), "storage clone started"); got != 1 {
+		t.Fatalf("git %v opened %d Storage Transport clones, want one:\n%s", arguments, got, output)
+	}
+	return string(output)
 }
 
 func TestMultiRefPushAndDeletionAreAtomic(t *testing.T) {

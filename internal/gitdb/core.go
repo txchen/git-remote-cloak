@@ -233,9 +233,13 @@ func ReachableObjectIDsForRefs(gitDirectory string, refs map[string]string) ([]s
 // Import adds authenticated Pack Payloads to an existing local Git object database.
 func Import(gitDirectory string, packs []cloakformat.PackPayload) error {
 	for _, payload := range packs {
+		present, err := objectPresence(gitDirectory, payload.ObjectIDs)
+		if err != nil {
+			return err
+		}
 		allPresent := true
 		for _, objectID := range payload.ObjectIDs {
-			if _, err := run(gitDirectory, nil, "cat-file", "-e", objectID+"^{object}"); err != nil {
+			if !present[objectID] {
 				allPresent = false
 				break
 			}
@@ -246,13 +250,48 @@ func Import(gitDirectory string, packs []cloakformat.PackPayload) error {
 		if _, err := run(gitDirectory, payload.Pack, "index-pack", "--stdin"); err != nil {
 			return fmt.Errorf("import native Git Pack Payload: %w", err)
 		}
+		present, err = objectPresence(gitDirectory, payload.ObjectIDs)
+		if err != nil {
+			return err
+		}
 		for _, objectID := range payload.ObjectIDs {
-			if _, err := run(gitDirectory, nil, "cat-file", "-e", objectID+"^{object}"); err != nil {
+			if !present[objectID] {
 				return fmt.Errorf("Encrypted Pack Index references missing Git object %s", objectID)
 			}
 		}
 	}
 	return nil
+}
+
+// objectPresence checks a pack index with one Git process, including missing
+// objects. Git's batch-check protocol returns one line per requested ID.
+func objectPresence(gitDirectory string, objectIDs []string) (map[string]bool, error) {
+	present := make(map[string]bool, len(objectIDs))
+	if len(objectIDs) == 0 {
+		return present, nil
+	}
+	output, err := run(gitDirectory, []byte(strings.Join(objectIDs, "\n")+"\n"), "cat-file", "--batch-check=%(objectname) %(objecttype)")
+	if err != nil {
+		return nil, fmt.Errorf("check Encrypted Pack Index objects: %w", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(output), "\n"), "\n")
+	if len(lines) != len(objectIDs) {
+		return nil, errors.New("Git returned malformed batch object metadata")
+	}
+	for index, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != objectIDs[index] {
+			return nil, errors.New("Git returned malformed batch object metadata")
+		}
+		switch fields[1] {
+		case "blob", "tree", "commit", "tag":
+			present[fields[0]] = true
+		case "missing":
+		default:
+			return nil, errors.New("Git returned malformed batch object metadata")
+		}
+	}
+	return present, nil
 }
 
 // Restore imports authenticated packs, restores refs and HEAD, and fully validates the result.

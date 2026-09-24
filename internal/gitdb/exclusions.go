@@ -1,9 +1,11 @@
 package gitdb
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -14,19 +16,18 @@ import (
 // RejectLFSPointers rejects supported refs that depend on Git LFS content. It
 // reports only affected local paths, never pointer contents or object IDs.
 func RejectLFSPointers(gitDirectory string, candidateObjectIDs []string) error {
-	candidates := make(map[string]struct{}, len(candidateObjectIDs))
-	for _, objectID := range candidateObjectIDs {
-		candidates[objectID] = struct{}{}
-	}
-	if len(candidates) == 0 {
+	if len(candidateObjectIDs) == 0 {
 		return nil
+	}
+	pointers, err := lfsPointerObjects(gitDirectory, candidateObjectIDs)
+	if err != nil || len(pointers) == 0 {
+		return err
 	}
 	commits, err := run(gitDirectory, nil, "rev-list", "--all")
 	if err != nil {
 		return fmt.Errorf("enumerate commits for Git LFS validation: %w", err)
 	}
 	affected := make(map[string]struct{})
-	checked := make(map[string]bool)
 	for _, commit := range strings.Fields(string(commits)) {
 		tree, err := run(gitDirectory, nil, "ls-tree", "-r", "-z", "--full-tree", commit)
 		if err != nil {
@@ -42,18 +43,7 @@ func RejectLFSPointers(gitDirectory string, candidateObjectIDs []string) error {
 				continue
 			}
 			objectID := fields[2]
-			if _, wanted := candidates[objectID]; !wanted {
-				continue
-			}
-			isPointer, exists := checked[objectID]
-			if !exists {
-				isPointer, err = isLFSPointer(gitDirectory, objectID)
-				if err != nil {
-					return err
-				}
-				checked[objectID] = isPointer
-			}
-			if isPointer {
+			if pointers[objectID] {
 				affected[string(path)] = struct{}{}
 			}
 		}
@@ -67,6 +57,74 @@ func RejectLFSPointers(gitDirectory string, candidateObjectIDs []string) error {
 	}
 	sort.Strings(paths)
 	return fmt.Errorf("Git LFS is unsupported; affected paths: %s", strings.Join(paths, ", "))
+}
+
+func lfsPointerObjects(gitDirectory string, candidateObjectIDs []string) (map[string]bool, error) {
+	pointers := make(map[string]bool)
+	// Bound each response when a repository has many small files.
+	for start := 0; start < len(candidateObjectIDs); start += 512 {
+		end := min(start+512, len(candidateObjectIDs))
+		ids := candidateObjectIDs[start:end]
+		output, err := run(gitDirectory, []byte(strings.Join(ids, "\n")+"\n"), "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+		if err != nil {
+			return nil, fmt.Errorf("inspect possible Git LFS pointers: %w", err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(output), "\n"), "\n")
+		if len(lines) != len(ids) {
+			return nil, errors.New("Git returned malformed batch object metadata")
+		}
+		smallBlobs := make([]string, 0)
+		for index, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) != 3 || fields[0] != ids[index] {
+				return nil, errors.New("Git returned malformed batch object metadata")
+			}
+			size, err := strconv.ParseInt(fields[2], 10, 64)
+			if err != nil || size < 0 {
+				return nil, errors.New("Git returned malformed batch object metadata")
+			}
+			if fields[1] == "blob" && size <= 1024 {
+				smallBlobs = append(smallBlobs, ids[index])
+			}
+		}
+		if len(smallBlobs) == 0 {
+			continue
+		}
+		contents, err := run(gitDirectory, []byte(strings.Join(smallBlobs, "\n")+"\n"), "cat-file", "--batch")
+		if err != nil {
+			return nil, fmt.Errorf("read possible Git LFS pointers: %w", err)
+		}
+		reader := bufio.NewReader(bytes.NewReader(contents))
+		for _, id := range smallBlobs {
+			header, err := reader.ReadString('\n')
+			if err != nil {
+				return nil, errors.New("Git returned malformed batch blob contents")
+			}
+			fields := strings.Fields(header)
+			if len(fields) != 3 || fields[0] != id || fields[1] != "blob" {
+				return nil, errors.New("Git returned malformed batch blob contents")
+			}
+			size, err := strconv.ParseInt(fields[2], 10, 64)
+			if err != nil || size < 0 || size > 1024 {
+				return nil, errors.New("Git returned malformed batch blob contents")
+			}
+			blob := make([]byte, size)
+			if _, err := io.ReadFull(reader, blob); err != nil {
+				return nil, errors.New("Git returned malformed batch blob contents")
+			}
+			separator, err := reader.ReadByte()
+			if err != nil || separator != '\n' {
+				return nil, errors.New("Git returned malformed batch blob contents")
+			}
+			if isLFSPointerContents(blob) {
+				pointers[id] = true
+			}
+		}
+		if _, err := reader.ReadByte(); err != io.EOF {
+			return nil, errors.New("Git returned malformed batch blob contents")
+		}
+	}
+	return pointers, nil
 }
 
 // RejectPromisorState fails closed when a local Git object database is marked
@@ -106,52 +164,37 @@ func RejectPromisorState(gitDirectory string) error {
 	return nil
 }
 
-func isLFSPointer(gitDirectory, objectID string) (bool, error) {
-	sizeOutput, err := run(gitDirectory, nil, "cat-file", "-s", objectID)
-	if err != nil {
-		return false, fmt.Errorf("inspect possible Git LFS pointer: %w", err)
-	}
-	size, err := strconv.ParseInt(strings.TrimSpace(string(sizeOutput)), 10, 64)
-	if err != nil {
-		return false, fmt.Errorf("parse Git blob size: %w", err)
-	}
-	if size > 1024 {
-		return false, nil
-	}
-	contents, err := run(gitDirectory, nil, "cat-file", "blob", objectID)
-	if err != nil {
-		return false, fmt.Errorf("read possible Git LFS pointer: %w", err)
-	}
+func isLFSPointerContents(contents []byte) bool {
 	lines := strings.Split(strings.TrimSuffix(string(contents), "\n"), "\n")
 	if len(lines) < 3 || lines[0] != "version https://git-lfs.github.com/spec/v1" {
-		return false, nil
+		return false
 	}
 	index := 1
 	extensions := make(map[string]struct{})
 	for index < len(lines) && strings.HasPrefix(lines[index], "ext-") {
 		key, valid := validLFSExtension(lines[index])
 		if !valid {
-			return false, nil
+			return false
 		}
 		if _, duplicate := extensions[key]; duplicate {
-			return false, nil
+			return false
 		}
 		extensions[key] = struct{}{}
 		index++
 	}
 	if index+2 != len(lines) || !strings.HasPrefix(lines[index], "oid sha256:") {
-		return false, nil
+		return false
 	}
 	digest := strings.TrimPrefix(lines[index], "oid sha256:")
 	if len(digest) != 64 || !isLowerHex(digest) {
-		return false, nil
+		return false
 	}
 	value, found := strings.CutPrefix(lines[index+1], "size ")
 	if !found || value == "" || len(value) > 1 && value[0] == '0' {
-		return false, nil
+		return false
 	}
-	_, err = strconv.ParseUint(value, 10, 64)
-	return err == nil, nil
+	_, err := strconv.ParseUint(value, 10, 64)
+	return err == nil
 }
 
 func validLFSExtension(line string) (string, bool) {

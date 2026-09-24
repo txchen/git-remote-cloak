@@ -41,10 +41,12 @@ func RunWithOptions(repositoryURL string, recoverySecret domain.RecoverySecret, 
 		repositoryEngine = engine.NewWithLocalState(gitDirectory)
 	}
 	diagnostics.Event("remote inspection started")
-	repository, err := repositoryEngine.Inspect(repositoryURL, recoverySecret)
+	inspection, err := repositoryEngine.OpenInspection(repositoryURL, recoverySecret)
 	if err != nil {
 		return err
 	}
+	defer inspection.Close()
+	repository := inspection.Repository()
 	diagnostics.Event("remote inspection completed")
 	reader := bufio.NewScanner(input)
 	writer := bufio.NewWriter(output)
@@ -148,7 +150,7 @@ func RunWithOptions(repositoryURL string, recoverySecret domain.RecoverySecret, 
 			if err != nil {
 				return err
 			}
-			if err := repositoryEngine.FetchInto(repositoryURL, gitDirectory, recoverySecret); err != nil {
+			if err := inspection.FetchInto(gitDirectory); err != nil {
 				return err
 			}
 			if shallowFetch.depth > 0 {
@@ -163,7 +165,7 @@ func RunWithOptions(repositoryURL string, recoverySecret domain.RecoverySecret, 
 			diagnostics.Count("requested ref updates", len(pushes))
 			gitDirectory, err := currentGitDirectory()
 			if err == nil {
-				err = repositoryEngine.PublishRefsWithOptions(repositoryURL, gitDirectory, pushes, recoverySecret, publishOptions)
+				err = repositoryEngine.PublishRefsFromInspection(repositoryURL, gitDirectory, pushes, recoverySecret, publishOptions, inspection)
 			}
 			if err != nil {
 				for _, push := range pushes {

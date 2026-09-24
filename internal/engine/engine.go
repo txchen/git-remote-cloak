@@ -1072,14 +1072,28 @@ func (engine *Engine) FetchInto(repositoryURL, gitDirectory string, secret domai
 	if err != nil {
 		return err
 	}
-	state := gitdb.State{
-		LogicalHEAD: decoded.Repository.LogicalHEAD, ObjectFormat: decoded.Repository.ObjectFormat,
-		LogicalRefs: decoded.Repository.LogicalRefs,
-	}
-	if err := gitdb.ValidateLogicalRepository(state, decoded.Packs); err != nil {
+	return gitdb.Import(gitDirectory, decoded.Packs)
+}
+
+// Inspection retains one fully validated Ciphertext Snapshot for a remote-helper
+// session. Its Storage Ref is still checked with compare-and-swap on publication.
+type Inspection struct {
+	transport *storage.Git
+	snapshot  authenticatedSnapshot
+}
+
+func (inspection *Inspection) Close() error { return inspection.transport.Close() }
+
+func (inspection *Inspection) Repository() cloakformat.SnapshotState {
+	return inspection.snapshot.Repository
+}
+
+// FetchInto imports the already validated packs advertised by this inspection.
+func (inspection *Inspection) FetchInto(gitDirectory string) error {
+	if err := gitdb.RejectPromisorState(gitDirectory); err != nil {
 		return err
 	}
-	return gitdb.Import(gitDirectory, decoded.Packs)
+	return gitdb.Import(gitDirectory, inspection.snapshot.Packs)
 }
 
 // RefUpdate is one requested Logical Ref change in an atomic push transaction.
@@ -1105,6 +1119,19 @@ func (engine *Engine) PublishRefs(repositoryURL, sourceGitDirectory string, upda
 
 // PublishRefsWithOptions applies a push with explicit maintenance policy.
 func (engine *Engine) PublishRefsWithOptions(repositoryURL, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret, options PublishOptions) error {
+	return engine.publishRefsWithInspection(repositoryURL, sourceGitDirectory, updates, secret, options, nil)
+}
+
+// PublishRefsFromInspection reuses the helper's validated snapshot on its first
+// attempt. A failed Storage Ref lease starts each retry from a fresh inspection.
+func (engine *Engine) PublishRefsFromInspection(repositoryURL, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret, options PublishOptions, inspection *Inspection) error {
+	if inspection == nil {
+		return errors.New("push requires an inspection")
+	}
+	return engine.publishRefsWithInspection(repositoryURL, sourceGitDirectory, updates, secret, options, inspection)
+}
+
+func (engine *Engine) publishRefsWithInspection(repositoryURL, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret, options PublishOptions, inspection *Inspection) error {
 	if len(updates) == 0 {
 		return errors.New("push transaction contains no Logical Ref updates")
 	}
@@ -1139,7 +1166,11 @@ func (engine *Engine) PublishRefsWithOptions(repositoryURL, sourceGitDirectory s
 
 	var concurrentErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		concurrentErr = engine.publishRefAttempt(repositoryURL, sourceGitDirectory, updates, secret, options)
+		if attempt == 1 && inspection != nil {
+			concurrentErr = engine.publishRefOnSnapshot(inspection.transport, inspection.snapshot.DecodedSnapshot, inspection.snapshot.StorageCommitID, sourceGitDirectory, updates, secret, options)
+		} else {
+			concurrentErr = engine.publishRefAttempt(repositoryURL, sourceGitDirectory, updates, secret, options)
+		}
 		if concurrentErr == nil {
 			return nil
 		}
@@ -1151,7 +1182,6 @@ func (engine *Engine) PublishRefsWithOptions(repositoryURL, sourceGitDirectory s
 }
 
 func (engine *Engine) publishRefAttempt(repositoryURL, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret, options PublishOptions) error {
-	defer diagnostics.Stage("push attempt")()
 	transport, err := storage.OpenGit(repositoryURL)
 	if err != nil {
 		return err
@@ -1161,6 +1191,11 @@ func (engine *Engine) publishRefAttempt(repositoryURL, sourceGitDirectory string
 	if err != nil {
 		return err
 	}
+	return engine.publishRefOnSnapshot(transport, current, storageCommitID, sourceGitDirectory, updates, secret, options)
+}
+
+func (engine *Engine) publishRefOnSnapshot(transport *storage.Git, current cloakformat.DecodedSnapshot, storageCommitID, sourceGitDirectory string, updates []RefUpdate, secret domain.RecoverySecret, options PublishOptions) error {
+	defer diagnostics.Stage("push attempt")()
 	temporaryRoot, err := os.MkdirTemp("", "git-remote-cloak-receive-")
 	if err != nil {
 		return err
@@ -1233,21 +1268,41 @@ type authenticatedSnapshot struct {
 }
 
 func (engine *Engine) readSnapshot(repositoryURL string, secret domain.RecoverySecret) (authenticatedSnapshot, error) {
+	inspection, err := engine.OpenInspection(repositoryURL, secret)
+	if err != nil {
+		return authenticatedSnapshot{}, err
+	}
+	defer inspection.Close()
+	return inspection.snapshot, nil
+}
+
+// OpenInspection authenticates one Storage Ref and keeps its transport alive
+// for the rest of the remote-helper protocol session.
+func (engine *Engine) OpenInspection(repositoryURL string, secret domain.RecoverySecret) (*Inspection, error) {
 	defer diagnostics.Stage("read current snapshot")()
 	transport, err := storage.OpenGit(repositoryURL)
 	if err != nil {
-		return authenticatedSnapshot{}, err
+		return nil, err
 	}
-	defer transport.Close()
+	closeOnError := true
+	defer func() {
+		if closeOnError {
+			_ = transport.Close()
+		}
+	}()
 	refs, err := transport.Refs()
 	if err != nil {
-		return authenticatedSnapshot{}, err
+		return nil, err
 	}
 	if len(refs) != 1 || refs[0] != storage.StorageRef {
-		return authenticatedSnapshot{}, errors.New("Repository Host does not expose exactly one Storage Ref")
+		return nil, errors.New("Repository Host does not expose exactly one Storage Ref")
 	}
 	decoded, storageCommitID, err := engine.decodeTransportSnapshot(secret, transport)
-	return authenticatedSnapshot{DecodedSnapshot: decoded, StorageCommitID: storageCommitID}, err
+	if err != nil {
+		return nil, err
+	}
+	closeOnError = false
+	return &Inspection{transport: transport, snapshot: authenticatedSnapshot{DecodedSnapshot: decoded, StorageCommitID: storageCommitID}}, nil
 }
 
 func (engine *Engine) decodeTransportSnapshot(secret domain.RecoverySecret, transport *storage.Git) (cloakformat.DecodedSnapshot, string, error) {

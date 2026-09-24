@@ -40,6 +40,10 @@ The accepted `v0.1.0` release gate is:
 
 Broader GitHub/GitLab × SSH/HTTPS certification remains available through the [provider certification runbook](provider-certification.md), but is outside the current `v0.1.0` support claim.
 
+## v0.4.0 changes
+
+Fetch, pull, and push reuse the authenticated Ciphertext Snapshot from the remote helper's initial inspection. A concurrent Storage Ref update still triggers a fresh read and compare-and-swap retry. Fetch no longer repeats full Logical Repository validation after the snapshot has already passed it. Git object existence checks and Git LFS pointer reads now use bounded batch operations, reducing Git subprocesses as repositories grow. Ciphertext Repository format remains v1.0.
+
 ## v0.3.3 changes
 
 Repeated inspection now reuses the cached Bootstrap Header when its bytes match the current Storage commit's Git tree. An absent or damaged cache entry falls back to the Repository Host and is repaired after authentication. This removes the remaining per-inspection blob fetch for an unchanged snapshot; Ciphertext Repository format remains v1.0.
